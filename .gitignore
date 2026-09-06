@@ -1,0 +1,11 @@
+/target
+
+# Cargo.lock is committed: this workspace produces binaries, not libraries.
+
+# Wallpaper Engine content is never committed. These files are other people's
+# copyrighted work; hyprwpe reads what the user already owns and redistributes
+# nothing. Test fixtures must be authored by us, not taken from a Workshop item.
+# See "Hard rules" in docs/FORMATS.md.
+*.pkg
+*.tex
+project.json
