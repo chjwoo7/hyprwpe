@@ -13,5 +13,7 @@ path = "src/main.rs"
 hyprwpe-core = { workspace = true }
 clap = { workspace = true }
 hyprwpe-render = { workspace = true }
+smithay-client-toolkit = { workspace = true }
+wayland-client = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

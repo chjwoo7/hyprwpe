@@ -4,5 +4,5 @@
 pub mod image_layer;
 pub mod scaling;
 
-pub use image_layer::ImageWallpaper;
+pub use image_layer::{Target, WallpaperSpec, Wallpapers};
 pub use scaling::{place, Placement, Scaling};

@@ -298,6 +298,8 @@ dependencies = [
  "hyprwpe-core",
  "hyprwpe-render",
  "serde_json",
+ "smithay-client-toolkit",
+ "wayland-client",
 ]
 
 [[package]]

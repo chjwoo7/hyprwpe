@@ -1,12 +1,17 @@
-//! Static image wallpaper on a `wlr-layer-shell` surface.
+//! Static image wallpapers on `wlr-layer-shell` surfaces, one per output.
 //!
 //! A still image needs no GPU context and no render loop: decode once, write one
-//! shm buffer per output, commit, and then sit idle. The compositor keeps the
-//! buffer and reuses it every frame, so the wallpaper costs nothing to keep on
-//! screen. This is the floor the rest of hyprwpe is measured against.
+//! shm buffer per output, commit, and go idle. The compositor keeps the buffer
+//! and reuses it every frame, so the wallpaper costs nothing to keep on screen.
+//! This is the floor the rest of hyprwpe is measured against.
+//!
+//! [`Wallpapers`] holds desired state and does not own an event loop, so the
+//! daemon can drive it alongside its IPC socket. [`Wallpapers::run_standalone`]
+//! wraps it in a loop for one-shot use.
 
 use anyhow::{Context, Result};
-use image::{imageops::FilterType, DynamicImage, RgbaImage};
+use hyprwpe_core::protocol::OutputStatus;
+use image::{imageops::FilterType, RgbaImage};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_registry,
@@ -22,9 +27,10 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use wayland_client::{
-    globals::registry_queue_init,
+    globals::{registry_queue_init, GlobalList},
     protocol::{wl_output, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
@@ -34,120 +40,163 @@ use crate::scaling::{place, Scaling};
 /// The layer to anchor to.
 ///
 /// `Background` sits below everything, including a shell's own desktop panel.
-/// That matters here: a shell drawing its wallpaper on `Bottom` would otherwise
-/// cover this surface, and a wallpaper on `Bottom` would cover the shell's
-/// desktop widgets. Neither is recoverable by z-order alone, so the default is
-/// the bottom-most layer and the shell is expected to stop painting.
+/// That matters: a wallpaper on `Bottom` covers a shell's desktop widgets, and a
+/// shell painting its own wallpaper on `Bottom` covers a wallpaper below it.
+/// Neither is recoverable by z-order alone, so hyprwpe takes the bottom-most
+/// layer and expects the shell to stop painting while it is running.
 pub const WALLPAPER_LAYER: Layer = Layer::Background;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WallpaperSpec {
+    pub path: PathBuf,
+    pub scaling: Scaling,
+}
+
+/// Which outputs a change applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// Every output, including ones connected later. Also clears per-output
+    /// pins, so "set everything" means what it says.
+    All,
+    Output(String),
+}
+
+/// Identifies a painted result, so an unchanged configure does not repaint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaintKey {
+    size: (u32, u32),
+    scale: i32,
+    spec: WallpaperSpec,
+}
 
 struct OutputLayer {
     output: wl_output::WlOutput,
+    name: String,
     layer: LayerSurface,
     /// Logical size from the compositor's configure.
     logical: (u32, u32),
     /// Output scale factor; the buffer is this many times larger.
     scale: i32,
-    /// Set once the current size has been painted, so repeat configures with
-    /// unchanged dimensions do not redraw.
-    painted: Option<(u32, u32, i32)>,
+    painted: Option<PaintKey>,
 }
 
-/// Where the pixels come from.
-///
-/// A decoded 4K image is tens of megabytes, and after a surface is painted the
-/// compositor holds the only copy that matters. `Reloadable` therefore drops the
-/// decoded pixels between draws and decodes again on demand — draws happen on
-/// configure, scale change and hotplug, which are rare. `Fixed` is for callers
-/// that handed us pixels with no path to reload from.
-enum ImageSource {
-    Reloadable {
-        path: std::path::PathBuf,
-        cached: Option<RgbaImage>,
-    },
-    Fixed(RgbaImage),
-}
-
-impl ImageSource {
-    fn load(&mut self) -> Result<&RgbaImage> {
-        match self {
-            ImageSource::Fixed(img) => Ok(img),
-            ImageSource::Reloadable { path, cached } => {
-                if cached.is_none() {
-                    let img = image::open(&*path)
-                        .with_context(|| format!("decoding {}", path.display()))?;
-                    *cached = Some(img.to_rgba8());
-                }
-                Ok(cached.as_ref().expect("just decoded"))
-            }
-        }
-    }
-
-    /// Release the decoded pixels if they can be recovered later.
-    fn release(&mut self) {
-        if let ImageSource::Reloadable { cached, .. } = self {
-            *cached = None;
-        }
-    }
-}
-
-pub struct ImageWallpaper {
+pub struct Wallpapers {
     registry_state: RegistryState,
     output_state: OutputState,
     compositor: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
     pool: SlotPool,
-    source: ImageSource,
-    scaling: Scaling,
+    /// Applies to any output without its own entry.
+    default_spec: Option<WallpaperSpec>,
+    per_output: HashMap<String, WallpaperSpec>,
+    /// Decoded pixels, held only between load and draw. A 4K image is tens of
+    /// megabytes and the compositor owns the copy that matters once committed,
+    /// so it is released after every draw and decoded again on demand.
+    cache: Option<(PathBuf, RgbaImage)>,
     background: [u8; 4],
     layers: Vec<OutputLayer>,
     exit: bool,
 }
 
-impl ImageWallpaper {
-    /// Decode `path` and show it on every output until the connection ends.
-    pub fn run(path: &Path, scaling: Scaling) -> Result<()> {
+impl Wallpapers {
+    pub fn new(globals: &GlobalList, qh: &QueueHandle<Self>) -> Result<Self> {
+        let shm = Shm::bind(globals, qh).context("compositor does not support wl_shm")?;
+        let pool = SlotPool::new(1, &shm).context("creating shm pool")?;
+        Ok(Wallpapers {
+            compositor: CompositorState::bind(globals, qh)
+                .context("compositor does not support wl_compositor")?,
+            layer_shell: LayerShell::bind(globals, qh)
+                .context("compositor does not support wlr-layer-shell")?,
+            output_state: OutputState::new(globals, qh),
+            registry_state: RegistryState::new(globals),
+            shm,
+            pool,
+            default_spec: None,
+            per_output: HashMap::new(),
+            cache: None,
+            background: [0, 0, 0, 255],
+            layers: Vec::new(),
+            exit: false,
+        })
+    }
+
+    /// Show `spec` on `target`. Decoding is deferred to the next draw, so an
+    /// unreadable file surfaces there rather than here.
+    pub fn set(&mut self, target: Target, spec: WallpaperSpec) {
+        match target {
+            Target::All => {
+                self.default_spec = Some(spec);
+                self.per_output.clear();
+            }
+            Target::Output(name) => {
+                self.per_output.insert(name, spec);
+            }
+        }
+        self.redraw_all();
+    }
+
+    /// Names of the outputs currently known, for validating a client's target.
+    pub fn output_names(&self) -> Vec<String> {
+        self.layers.iter().map(|l| l.name.clone()).collect()
+    }
+
+    fn spec_for(&self, name: &str) -> Option<&WallpaperSpec> {
+        self.per_output.get(name).or(self.default_spec.as_ref())
+    }
+
+    fn redraw_all(&mut self) {
+        for i in 0..self.layers.len() {
+            if let Err(e) = self.draw(i) {
+                eprintln!("hyprwpe: {e:#}");
+            }
+        }
+    }
+
+    pub fn status(&self) -> Vec<OutputStatus> {
+        self.layers
+            .iter()
+            .map(|l| {
+                let spec = self.spec_for(&l.name);
+                OutputStatus {
+                    name: l.name.clone(),
+                    width: l.logical.0,
+                    height: l.logical.1,
+                    scale: l.scale,
+                    wallpaper: spec.map(|s| s.path.clone()),
+                    scaling: spec.map(|s| s.scaling.as_str().to_string()),
+                }
+            })
+            .collect()
+    }
+
+    pub fn should_exit(&self) -> bool {
+        self.exit
+    }
+
+    pub fn request_exit(&mut self) {
+        self.exit = true;
+    }
+
+    /// Show one image on every output, driving an event loop until interrupted.
+    pub fn run_standalone(path: &Path, scaling: Scaling) -> Result<()> {
         // Decode once up front so an unreadable file fails immediately rather
         // than at the first configure.
-        let probe = image::open(path).with_context(|| format!("decoding {}", path.display()))?;
-        drop(probe);
-        Self::start(
-            ImageSource::Reloadable {
-                path: path.to_path_buf(),
-                cached: None,
-            },
-            scaling,
-        )
-    }
+        image::open(path).with_context(|| format!("decoding {}", path.display()))?;
 
-    pub fn run_image(source: DynamicImage, scaling: Scaling) -> Result<()> {
-        Self::start(ImageSource::Fixed(source.to_rgba8()), scaling)
-    }
-
-    fn start(source: ImageSource, scaling: Scaling) -> Result<()> {
         let conn = Connection::connect_to_env()
             .context("connecting to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
         let (globals, mut queue) = registry_queue_init(&conn).context("initialising registry")?;
         let qh: QueueHandle<Self> = queue.handle();
 
-        let shm = Shm::bind(&globals, &qh).context("compositor does not support wl_shm")?;
-        let pool = SlotPool::new(1, &shm).context("creating shm pool")?;
-
-        let mut state = ImageWallpaper {
-            compositor: CompositorState::bind(&globals, &qh)
-                .context("compositor does not support wl_compositor")?,
-            layer_shell: LayerShell::bind(&globals, &qh)
-                .context("compositor does not support wlr-layer-shell")?,
-            output_state: OutputState::new(&globals, &qh),
-            registry_state: RegistryState::new(&globals),
-            shm,
-            pool,
-            source,
-            scaling,
-            background: [0, 0, 0, 255],
-            layers: Vec::new(),
-            exit: false,
-        };
+        let mut state = Wallpapers::new(&globals, &qh)?;
+        state.set(
+            Target::All,
+            WallpaperSpec {
+                path: path.to_path_buf(),
+                scaling,
+            },
+        );
 
         while !state.exit {
             queue
@@ -155,6 +204,13 @@ impl ImageWallpaper {
                 .context("wayland dispatch")?;
         }
         Ok(())
+    }
+
+    fn output_name(&self, output: &wl_output::WlOutput) -> String {
+        self.output_state
+            .info(output)
+            .and_then(|i| i.name)
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
@@ -178,9 +234,11 @@ impl ImageWallpaper {
             .info(&output)
             .map(|i| i.scale_factor)
             .unwrap_or(1);
+        let name = self.output_name(&output);
 
         self.layers.push(OutputLayer {
             output,
+            name,
             layer,
             logical: (0, 0),
             scale,
@@ -188,13 +246,40 @@ impl ImageWallpaper {
         });
     }
 
+    /// Decoded pixels for `path`, reusing the cache when it already holds them.
+    fn load(&mut self, path: &Path) -> Result<()> {
+        let stale = match &self.cache {
+            Some((cached, _)) => cached != path,
+            None => true,
+        };
+        if stale {
+            let img = image::open(path)
+                .with_context(|| format!("decoding {}", path.display()))?
+                .to_rgba8();
+            self.cache = Some((path.to_path_buf(), img));
+        }
+        Ok(())
+    }
+
     fn draw(&mut self, index: usize) -> Result<()> {
-        let (logical, scale) = {
+        let (logical, scale, name) = {
             let l = &self.layers[index];
-            (l.logical, l.scale.max(1))
+            (l.logical, l.scale.max(1), l.name.clone())
         };
         let (lw, lh) = logical;
         if lw == 0 || lh == 0 {
+            return Ok(());
+        }
+        let Some(spec) = self.spec_for(&name).cloned() else {
+            return Ok(());
+        };
+
+        let key = PaintKey {
+            size: (lw, lh),
+            scale,
+            spec: spec.clone(),
+        };
+        if self.layers[index].painted.as_ref() == Some(&key) {
             return Ok(());
         }
 
@@ -204,16 +289,18 @@ impl ImageWallpaper {
         let height = lh * scale as u32;
         let stride = width as i32 * 4;
 
-        // Destructured so the pool and the image are borrowed as disjoint
+        self.load(&spec.path)?;
+
+        // Destructured so the pool and the cached image are borrowed as disjoint
         // fields; `canvas` borrows the pool for as long as it is written to.
         let Self {
             pool,
-            source,
-            scaling,
+            cache,
             background,
             layers,
             ..
         } = self;
+        let source = &cache.as_ref().expect("loaded above").1;
 
         let (buffer, canvas) = pool
             .create_buffer(
@@ -224,9 +311,7 @@ impl ImageWallpaper {
             )
             .context("allocating shm buffer")?;
 
-        paint(canvas, width, height, source.load()?, *scaling, *background);
-        // The compositor now owns a copy; ours is recoverable from disk.
-        source.release();
+        paint(canvas, width, height, source, spec.scaling, *background);
 
         let l = &mut layers[index];
         let surface: &wl_surface::WlSurface = l.layer.wl_surface();
@@ -234,7 +319,10 @@ impl ImageWallpaper {
         surface.damage_buffer(0, 0, width as i32, height as i32);
         buffer.attach_to(surface).context("attaching buffer")?;
         surface.commit();
-        l.painted = Some((lw, lh, scale));
+        l.painted = Some(key);
+
+        // The compositor now owns a copy; ours is recoverable from disk.
+        self.cache = None;
         Ok(())
     }
 }
@@ -252,54 +340,52 @@ pub(crate) fn paint(
     background: [u8; 4],
 ) {
     let bg = [background[2], background[1], background[0], background[3]];
-    {
-        let p = place(scaling, source.width(), source.height(), width, height);
+    let p = place(scaling, source.width(), source.height(), width, height);
 
-        if p.width == 0 || p.height == 0 {
-            for px in canvas.as_chunks_mut::<4>().0 {
-                *px = bg;
-            }
-            return;
+    if p.width == 0 || p.height == 0 {
+        for px in canvas.as_chunks_mut::<4>().0 {
+            *px = bg;
         }
+        return;
+    }
 
-        if p.leaves_gaps(width, height) {
-            for px in canvas.as_chunks_mut::<4>().0 {
-                *px = bg;
-            }
+    if p.leaves_gaps(width, height) {
+        for px in canvas.as_chunks_mut::<4>().0 {
+            *px = bg;
         }
+    }
 
-        let scaled = image::imageops::resize(
-            source,
-            p.width,
-            p.height,
-            // Lanczos on a one-shot decode is worth the milliseconds; it is paid
-            // once per output and never again.
-            FilterType::Lanczos3,
-        );
+    let scaled = image::imageops::resize(
+        source,
+        p.width,
+        p.height,
+        // Lanczos on a one-shot decode is worth the milliseconds; it is paid
+        // once per output and never again.
+        FilterType::Lanczos3,
+    );
 
-        for row in 0..p.height as i64 {
-            let dy = p.y + row;
-            if dy < 0 || dy >= height as i64 {
+    for row in 0..p.height as i64 {
+        let dy = p.y + row;
+        if dy < 0 || dy >= height as i64 {
+            continue;
+        }
+        for col in 0..p.width as i64 {
+            let dx = p.x + col;
+            if dx < 0 || dx >= width as i64 {
                 continue;
             }
-            for col in 0..p.width as i64 {
-                let dx = p.x + col;
-                if dx < 0 || dx >= width as i64 {
-                    continue;
-                }
-                let src = scaled.get_pixel(col as u32, row as u32).0;
-                let off = ((dy as usize) * width as usize + dx as usize) * 4;
-                // RGBA -> BGRA
-                canvas[off] = src[2];
-                canvas[off + 1] = src[1];
-                canvas[off + 2] = src[0];
-                canvas[off + 3] = src[3];
-            }
+            let src = scaled.get_pixel(col as u32, row as u32).0;
+            let off = ((dy as usize) * width as usize + dx as usize) * 4;
+            // RGBA -> BGRA
+            canvas[off] = src[2];
+            canvas[off + 1] = src[1];
+            canvas[off + 2] = src[0];
+            canvas[off + 3] = src[3];
         }
     }
 }
 
-impl CompositorHandler for ImageWallpaper {
+impl CompositorHandler for Wallpapers {
     fn scale_factor_changed(
         &mut self,
         _: &Connection,
@@ -351,7 +437,7 @@ impl CompositorHandler for ImageWallpaper {
     }
 }
 
-impl OutputHandler for ImageWallpaper {
+impl OutputHandler for Wallpapers {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
@@ -371,7 +457,9 @@ impl OutputHandler for ImageWallpaper {
             .info(&output)
             .map(|i| i.scale_factor)
             .unwrap_or(1);
+        let name = self.output_name(&output);
         if let Some(i) = self.layers.iter().position(|l| l.output == output) {
+            self.layers[i].name = name;
             if self.layers[i].scale != scale {
                 self.layers[i].scale = scale;
                 let _ = self.draw(i);
@@ -380,7 +468,8 @@ impl OutputHandler for ImageWallpaper {
     }
 
     /// A monitor was unplugged. Dropping its layer surface is all that is
-    /// needed; the remaining outputs are untouched.
+    /// needed; the remaining outputs are untouched. The per-output spec is kept
+    /// so plugging the monitor back in restores what it had.
     fn output_destroyed(
         &mut self,
         _: &Connection,
@@ -391,12 +480,9 @@ impl OutputHandler for ImageWallpaper {
     }
 }
 
-impl LayerShellHandler for ImageWallpaper {
+impl LayerShellHandler for Wallpapers {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         self.layers.retain(|l| &l.layer != layer);
-        if self.layers.is_empty() {
-            self.exit = true;
-        }
     }
 
     fn configure(
@@ -415,35 +501,30 @@ impl LayerShellHandler for ImageWallpaper {
             return;
         }
         self.layers[i].logical = (w, h);
-        let key = (w, h, self.layers[i].scale);
-        if self.layers[i].painted == Some(key) {
-            return;
-        }
         if let Err(e) = self.draw(i) {
             eprintln!("hyprwpe: {e:#}");
         }
     }
 }
 
-impl ShmHandler for ImageWallpaper {
+impl ShmHandler for Wallpapers {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
     }
 }
 
-impl ProvidesRegistryState for ImageWallpaper {
+impl ProvidesRegistryState for Wallpapers {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
     registry_handlers![OutputState];
 }
 
-delegate_registry!(ImageWallpaper);
+delegate_registry!(Wallpapers);
 
 // smithay-client-toolkit 0.21 replaced the per-protocol delegate macros with one
 // blanket impl covering every protocol the toolkit handles.
-smithay_client_toolkit::delegate_dispatch2!(ImageWallpaper);
-
+smithay_client_toolkit::delegate_dispatch2!(Wallpapers);
 #[cfg(test)]
 mod tests {
     use super::*;

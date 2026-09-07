@@ -4,11 +4,15 @@
 //! subcommand is a thin client. Anything the GUI can do must be reachable here
 //! first.
 
-use anyhow::Result;
+mod client;
+mod daemon;
+
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use hyprwpe_core::{config, Catalog, Kind, Source};
-use hyprwpe_render::{ImageWallpaper, Scaling};
-use std::path::PathBuf;
+use hyprwpe_core::protocol::{self, Request, Response};
+use hyprwpe_core::{config, Catalog, Kind, Source, WallpaperId};
+use hyprwpe_render::{Scaling, Wallpapers};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "hyprwpe", version, about = "Wallpaper daemon for Hyprland")]
@@ -19,6 +23,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the daemon. It owns the wallpaper surfaces for the whole session.
+    Daemon,
+
+    /// Set the wallpaper. Accepts an image path or a catalog id.
+    Set {
+        /// Image file, or an id from `hyprwpe list`.
+        wallpaper: String,
+        /// Restrict to one output, e.g. `DP-2`. Defaults to every output.
+        #[arg(long, value_name = "NAME")]
+        output: Option<String>,
+        /// How to fit the image to each output.
+        #[arg(long, value_enum, default_value_t = ScalingArg::Fill)]
+        scaling: ScalingArg,
+    },
+
+    /// Per-output state and resource use.
+    Status {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Ask the daemon to exit.
+    Stop,
+
     /// List wallpapers hyprwpe can see.
     List {
         /// Show only wallpapers of this kind.
@@ -30,39 +59,17 @@ enum Command {
         /// Scan this directory instead of the configured sources. Workshop
         /// items are recognised by the presence of project.json.
         #[arg(long, value_name = "PATH")]
-        source: Vec<std::path::PathBuf>,
+        source: Vec<PathBuf>,
     },
 
-    /// Show a still image on every output and hold it there until interrupted.
+    /// Show an image without a daemon, holding it until interrupted.
     ///
-    /// A foreground command for now: the daemon that owns this surface, and the
-    /// `set` that talks to it, land with the reconciler.
+    /// Useful for testing a renderer in isolation; `set` is the normal way in.
     Show {
-        /// Image file to display.
         image: PathBuf,
-        /// How to fit the image to each output.
         #[arg(long, value_enum, default_value_t = ScalingArg::Fill)]
         scaling: ScalingArg,
     },
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum ScalingArg {
-    Fill,
-    Fit,
-    Stretch,
-    Center,
-}
-
-impl From<ScalingArg> for Scaling {
-    fn from(s: ScalingArg) -> Scaling {
-        match s {
-            ScalingArg::Fill => Scaling::Fill,
-            ScalingArg::Fit => Scaling::Fit,
-            ScalingArg::Stretch => Scaling::Stretch,
-            ScalingArg::Center => Scaling::Center,
-        }
-    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -86,16 +93,51 @@ impl From<KindArg> for Kind {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum ScalingArg {
+    Fill,
+    Fit,
+    Stretch,
+    Center,
+}
+
+impl From<ScalingArg> for Scaling {
+    fn from(s: ScalingArg) -> Scaling {
+        match s {
+            ScalingArg::Fill => Scaling::Fill,
+            ScalingArg::Fit => Scaling::Fit,
+            ScalingArg::Stretch => Scaling::Stretch,
+            ScalingArg::Center => Scaling::Center,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Daemon => daemon::run(),
+        Command::Set {
+            wallpaper,
+            output,
+            scaling,
+        } => set(&wallpaper, output, scaling.into()),
+        Command::Status { json } => status(json),
+        Command::Stop => stop(),
         Command::List { kind, json, source } => list(kind.map(Kind::from), json, source),
-        Command::Show { image, scaling } => ImageWallpaper::run(&image, scaling.into()),
+        Command::Show { image, scaling } => Wallpapers::run_standalone(&image, scaling.into()),
+    }
+}
+
+fn sources_from(paths: Vec<PathBuf>) -> Vec<Source> {
+    if paths.is_empty() {
+        config::default_sources()
+    } else {
+        paths.into_iter().map(source_for).collect()
     }
 }
 
 /// A directory holding `project.json` children is a Workshop root; anything else
 /// is a plain image directory. Saves the user from stating which is which.
-fn source_for(path: std::path::PathBuf) -> Source {
+fn source_for(path: PathBuf) -> Source {
     let looks_like_workshop = std::fs::read_dir(&path)
         .map(|entries| {
             entries
@@ -114,13 +156,100 @@ fn source_for(path: std::path::PathBuf) -> Source {
     }
 }
 
-fn list(kind: Option<Kind>, json: bool, sources: Vec<std::path::PathBuf>) -> Result<()> {
-    let sources: Vec<Source> = if sources.is_empty() {
-        config::default_sources()
-    } else {
-        sources.into_iter().map(source_for).collect()
+/// Turn what the user typed into a file the daemon can render.
+///
+/// A path is used directly. Anything else is looked up in the catalog, so
+/// `hyprwpe set 2904275363` works straight from a `list`. Wallpapers hyprwpe
+/// cannot render yet are refused by name rather than silently ignored.
+fn resolve(wallpaper: &str) -> Result<PathBuf> {
+    let as_path = Path::new(wallpaper);
+    if as_path.is_file() {
+        return Ok(as_path.to_path_buf());
+    }
+
+    let catalog = Catalog::scan(&config::default_sources());
+    let found = catalog.wallpapers.iter().find(|w| match &w.id {
+        WallpaperId::Wpe(id) => id == wallpaper,
+        WallpaperId::File(p) => p.as_os_str() == wallpaper,
+    });
+
+    let Some(w) = found else {
+        bail!("{wallpaper:?} is neither a readable file nor a known wallpaper id");
     };
 
+    match w.kind {
+        Kind::Image => Ok(w.path.clone()),
+        other => bail!(
+            "{:?} is a {} wallpaper, which hyprwpe cannot render yet",
+            w.title,
+            other.as_str()
+        ),
+    }
+}
+
+fn set(wallpaper: &str, output: Option<String>, scaling: Scaling) -> Result<()> {
+    let path = resolve(wallpaper)?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+
+    let target = match output {
+        Some(name) => protocol::Target::Output(name),
+        None => protocol::Target::All,
+    };
+
+    client::send_ok(&Request::Set {
+        path,
+        target: target.clone(),
+        scaling: scaling.as_str().to_string(),
+    })?;
+    eprintln!("set {} on {}", wallpaper, target);
+    Ok(())
+}
+
+fn status(json: bool) -> Result<()> {
+    let Response::Status(status) = client::send_ok(&Request::Status)? else {
+        bail!("daemon returned an unexpected response to status");
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+
+    if status.outputs.is_empty() {
+        println!("no outputs");
+    }
+    for o in &status.outputs {
+        let wallpaper = o
+            .wallpaper
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".into());
+        let scaling = o.scaling.as_deref().unwrap_or("-");
+        println!(
+            "{:<10} {}x{} @{}x  {:<8} {}",
+            o.name, o.width, o.height, o.scale, scaling, wallpaper
+        );
+    }
+    if let Some(kb) = status.rss_kb {
+        println!("\ndaemon rss: {:.0} MB", kb as f64 / 1024.0);
+    }
+    Ok(())
+}
+
+fn stop() -> Result<()> {
+    if !client::daemon_running() {
+        eprintln!("no daemon running");
+        return Ok(());
+    }
+    client::send_ok(&Request::Stop)?;
+    eprintln!("daemon stopping");
+    Ok(())
+}
+
+fn list(kind: Option<Kind>, json: bool, sources: Vec<PathBuf>) -> Result<()> {
+    let sources = sources_from(sources);
     if sources.is_empty() {
         eprintln!("No wallpaper sources found.");
         eprintln!("Point hyprwpe at one with --source <PATH>.");

@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod config;
 pub mod pkg;
+pub mod protocol;
 
 pub use catalog::{Catalog, Kind, Source, Wallpaper, WallpaperId};
 pub use pkg::Package;
