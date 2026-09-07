@@ -9,3 +9,6 @@
 *.pkg
 *.tex
 project.json
+
+# Local Claude Code settings (permission allowlist) — personal, not shared.
+.claude/
