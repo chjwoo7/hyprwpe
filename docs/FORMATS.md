@@ -70,28 +70,89 @@ is what the policy forbids.
 Never `read-source` on a GPL implementation. There is no tag for it because it
 must not happen.
 
-## Sample files
+## Sample corpus
 
-Findings should cite a sample so they can be re-checked.
+Findings below were checked against a personal library of 75 `scene.pkg` files.
+The files themselves are not in this repository and never will be; only the
+conclusions are.
 
-| Ref | File | Notes |
+## `scene.pkg` container — confirmed
+
+All integers are little-endian `u32`. Strings are length-prefixed and not
+NUL-terminated.
+
+```
+u32    version_len
+char[] version                  e.g. "PKGV0001"
+u32    entry_count
+entry_count ×
+    u32    name_len
+    char[] name                 e.g. "scene.json", "materials/x.json"
+    u32    offset               relative to the end of the entry table
+    u32    size
+<blob>                          entry data, addressed by offset + size
+```
+
+| Field | Source | Note |
 | --- | --- | --- |
-| — | — | Populate as work starts |
+| `version_len` | `bytes` | `08` at 0x00, matching the 8-byte version that follows |
+| `version` | `bytes` | `PKGV####`; 20 distinct values seen, see below |
+| `entry_count` | `experiment` | Read as a count, then verified structurally |
+| `name_len`, `name` | `bytes` | Readable ASCII paths immediately follow each length |
+| `offset` | `experiment` | Relative to the end of the table, not to file start |
+| `size` | `experiment` | |
 
-## `scene.pkg` container
+**How it was verified.** If the layout is right, the table must end exactly where
+the data begins, so `table_end + max(offset + size)` must equal the file size
+precisely. It does, for all 75 files — an off-by-one anywhere would break the
+identity. As a second check, the entry named `scene.json` was extracted from
+every file and parsed as JSON: 75 of 75 succeeded.
 
-Magic `PKGV0001` observed at offset 0x04 of a sample scene package, preceded by a
-4-byte little-endian value of `08` — consistent with a length-prefixed version
-string. Entries follow as length-prefixed names with offset and size fields.
+**Version variants.** The version string varies (`PKGV0001` … `PKGV0023`, 20
+distinct values in the corpus) but the entry-table layout above parses all of
+them. Whether later versions change the *contents* is a separate question; the
+container does not appear to differ.
 
-| Offset | Field | Type | Meaning | Source |
-| --- | --- | --- | --- | --- |
-| 0x00 | version_len | u32 le | `08`, length of the version string | `bytes` |
-| 0x04 | version | char[8] | `PKGV0001` | `bytes` |
-| 0x0C | ... | | Entry table — to be confirmed | |
+## Package contents
 
-Everything below the version string is provisional until parsed properly and
-re-verified against several packages.
+Extension counts across the corpus, useful for knowing what a renderer must
+eventually handle:
+
+| Extension | Count | |
+| --- | --- | --- |
+| `.json` | 2269 | scene, materials, effects, particle definitions |
+| `.tex` | 997 | textures |
+| `.vert` / `.frag` | 468 each | shader pairs |
+| `.mdl` | 48 | models |
+| `.mp3` / `.ogg` / `.wav` | 90 | audio |
+| `.otf` / `.ttf` | 18 | fonts |
+
+**Effects are self-contained.** Every one of 1171 effect references in the corpus
+resolves to a file *inside its own package* — none point at a shared Wallpaper
+Engine effect library. A renderer therefore never needs Wallpaper Engine's
+built-in effects: each wallpaper carries the effect definitions and shaders it
+uses. This materially reduces the scope of the scene renderer.
+
+## `scene.json`
+
+Top-level keys, with the number of files containing each:
+
+| Key | Files | |
+| --- | --- | --- |
+| `camera` | 75/75 | |
+| `general` | 75/75 | |
+| `objects` | 75/75 | the scene graph |
+| `version` | 57/75 | absent in older packages |
+
+Objects per scene: 1 minimum, 8 median, 271 maximum; 1450 in total.
+
+An object's kind is implied by which key it carries — `image`, `particle`,
+`sound`, `text` or `light` — rather than by a type field. Common transform and
+appearance keys (`origin`, `scale`, `angles`, `visible`, `parallaxDepth`,
+`alpha`, `color`, `effects`, `parent`) are shared across kinds.
+
+See [`SCENE-COVERAGE.md`](SCENE-COVERAGE.md) for how often each kind and effect
+appears, which is what drives the renderer's build order.
 
 ## `.tex` textures
 

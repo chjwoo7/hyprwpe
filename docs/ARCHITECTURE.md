@@ -584,9 +584,10 @@ this lands.
 **P4 — Video and shader renderers.** libmpv and GLSL. At this point every format
 except Wallpaper Engine's own is covered.
 
-**P5 — Scene renderer.** Incremental, in the order given under *Scene renderer*.
-Ships as soon as it renders a useful subset; the catalog marks what is not
-supported yet.
+**P5 — Scene renderer.** Incremental, in the order set out in
+[`SCENE-COVERAGE.md`](SCENE-COVERAGE.md), which measures how many wallpapers each
+feature unlocks. Ships as soon as it renders a useful subset; the catalog marks
+what is only partially supported.
 
 **P6 — Shell integration.** QML module and the upstream option.
 
