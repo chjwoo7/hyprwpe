@@ -7,6 +7,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use hyprwpe_core::{config, Catalog, Kind, Source};
+use hyprwpe_render::{ImageWallpaper, Scaling};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "hyprwpe", version, about = "Wallpaper daemon for Hyprland")]
@@ -30,6 +32,37 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         source: Vec<std::path::PathBuf>,
     },
+
+    /// Show a still image on every output and hold it there until interrupted.
+    ///
+    /// A foreground command for now: the daemon that owns this surface, and the
+    /// `set` that talks to it, land with the reconciler.
+    Show {
+        /// Image file to display.
+        image: PathBuf,
+        /// How to fit the image to each output.
+        #[arg(long, value_enum, default_value_t = ScalingArg::Fill)]
+        scaling: ScalingArg,
+    },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum ScalingArg {
+    Fill,
+    Fit,
+    Stretch,
+    Center,
+}
+
+impl From<ScalingArg> for Scaling {
+    fn from(s: ScalingArg) -> Scaling {
+        match s {
+            ScalingArg::Fill => Scaling::Fill,
+            ScalingArg::Fit => Scaling::Fit,
+            ScalingArg::Stretch => Scaling::Stretch,
+            ScalingArg::Center => Scaling::Center,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -56,6 +89,7 @@ impl From<KindArg> for Kind {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::List { kind, json, source } => list(kind.map(Kind::from), json, source),
+        Command::Show { image, scaling } => ImageWallpaper::run(&image, scaling.into()),
     }
 }
 
