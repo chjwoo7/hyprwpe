@@ -1,0 +1,16 @@
+[package]
+name = "hyprwpe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hyprwpe"
+path = "src/main.rs"
+
+[dependencies]
+hyprwpe-core = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

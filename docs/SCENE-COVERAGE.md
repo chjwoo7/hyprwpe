@@ -4,7 +4,9 @@ The scene renderer is the largest piece of work in hyprwpe and the one with no
 obvious finish line. This document replaces guesswork about that "long tail" with
 a measurement, so the build order follows evidence rather than instinct.
 
-Numbers come from a personal library of **75 scene wallpapers, 1450 objects**.
+Numbers come from a personal library of **75 scene packages, 1450 objects** —
+every `scene.pkg` in a 95-item Workshop library (76 items declare `type: scene`;
+one of them ships no package).
 It is one library, not a representative sample of the Workshop — treat the shape
 of the curve as informative and the exact percentages as local.
 

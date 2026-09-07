@@ -199,8 +199,8 @@ requires Steam to be installed — a `workshop` source is just a directory whose
 children carry `project.json`.
 
 For a Workshop item the catalog reads `project.json` for `title`, `type`, `file`
-and `preview`; on the reference library of 93 items that is 75 `scene`, 10
-`video` and 8 `web`. For a plain file the path is the identity, the filename is
+and `preview`; on the reference library of 95 items that is 76 `scene`, 10
+`video` and 9 `web`. For a plain file the path is the identity, the filename is
 the title, and the extension gives the kind. The image extension set matches the
 one the end4 shell already uses, so a wallpaper visible in the shell's own picker
 is visible here too.
@@ -218,7 +218,7 @@ it.
 
 The Wallpaper Engine `scene` format is the largest piece of work in the project
 and the reason hyprwpe can be a single self-contained package. On the reference
-library it is 75 of 93 items, so it is also the format that matters most.
+library it is 76 of 95 items, so it is also the format that matters most.
 
 What has to be implemented:
 
@@ -564,7 +564,7 @@ Each phase ships something usable. The scene renderer is long, so it must never
 be the thing standing between the project and a working release.
 
 **P0 — Catalog.** `core` crate plus `hyprwpe list`, over both source kinds:
-Workshop items and image directories. Reports kind, title and preview for all 93
+Workshop items and image directories. Reports kind, title and preview for all 95
 reference items without rendering any of them.
 
 **P1 — Daemon and image renderer.** Desired state, reconciler, `set`, `status`,
@@ -595,7 +595,7 @@ what is only partially supported.
 themselves; what the user never has to do is install and configure a separate
 wallpaper runtime.
 
-**Deferred — Web wallpapers.** 8 of 93 reference items. Supporting them means
+**Deferred — Web wallpapers.** 9 of 95 reference items. Supporting them means
 embedding a browser engine, which would undo the single-package goal for a small
 minority of wallpapers. Revisited only if the rest is done.
 

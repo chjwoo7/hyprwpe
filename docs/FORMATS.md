@@ -73,6 +73,11 @@ must not happen.
 ## Sample corpus
 
 Findings below were checked against a personal library of 75 `scene.pkg` files.
+The library holds 95 Workshop items in total: 76 `scene`, 10 `video` and 9
+`web`. 75 of the 76 scene items carry a `scene.pkg`; the odd one out declares
+`type: scene` with no package, which is why the catalog reports declared type
+and rendering support separately.
+
 The files themselves are not in this repository and never will be; only the
 conclusions are.
 
@@ -155,10 +160,6 @@ See [`SCENE-COVERAGE.md`](SCENE-COVERAGE.md) for how often each kind and effect
 appears, which is what drives the renderer's build order.
 
 ## `.tex` textures
-
-Not started.
-
-## `scene.json`
 
 Not started.
 
