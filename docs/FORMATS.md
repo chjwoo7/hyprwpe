@@ -183,6 +183,71 @@ u32    height                   image height in pixels
 | `width`, `height` | `bytes` | Positive dimensions matching layer aspect ratios |
 | `data` | `bytes` | Raw RGBA8 or BC1/BC2/BC3 blocks |
 
+### `TEXV0005` container — confirmed
+
+Modern scenes ship every `.tex` as `TEXV0005` (997/997 in the corpus). The
+layout differs from the legacy direct `.tex` above:
+
+```
+char[8]  magic                 "TEXV0005"
+char[1]  0x00
+char[8]  info magic            "TEXI0001"
+u32      flags                 usually 0
+u32      ?                     often 512
+u32      width  (16.16 fixed)  width  * 256
+u32      height (16.16 fixed)  height * 256
+u32      ?                     often width  * 256 again
+u32      ?                     often height * 256 again
+char[8]  payload magic         "TEXB0003" / "TEXB0004" / "TEXB0002"
+...
+```
+
+The `TEXB####` payload block's revision selects the encoding:
+
+| Revision | Count | Payload |
+| --- | --- | --- |
+| `TEXB0003` | 891 | Embedded **PNG or JPEG** image (dominant case) |
+| `TEXB0004` | 103 | Embedded PNG/JPEG |
+| `TEXB0002` | 3 | Raw block-compressed texture data |
+
+| Field | Source | Note |
+| --- | --- | --- |
+| `TEXV0005` magic | `bytes` | `54 45 58 56 30 30 30 35` at 0x00 |
+| `TEXI0001` info | `bytes` | Fixed-width sub-block; carries width/height as 16.16 |
+| `width`, `height` | `experiment` | Stored `value * 256`; 1920x1080 stores `0x1E0000` |
+| embedded PNG/JPEG | `bytes` | `\x89PNG` / `\xff\xd8\xff` signature inside the payload block |
+| `TEXB0003/4/2` | `bytes` | Revision byte at offset `magic+6` |
+
+**How it is read for rendering.** When a `.tex` embeds a PNG/JPEG, the image
+is decoded directly with the `image` crate (dimensions and pixels both come
+from the embedded image, so the 16.16 header is informational). Raw-BC payloads
+(`TEXB0002`) are decompressed with the built-in DXT1/3/5 decoders, matching the
+declared dimensions.
+
+### Materials reference textures relative to `materials/`
+
+The `textures` array inside a material (`passes[].textures` or a top-level
+`textures`) holds **paths relative to the package `materials/` directory**, with
+no leading `materials/` and, for the dominant form, no extension:
+
+| Material | `textures[0]` | Resolved entry |
+| --- | --- | --- |
+| `materials/akalibackground2.json` | `akalibackground2` | `materials/akalibackground2.tex` |
+| `materials/workshop/3518164866/背景2.json` | `workshop/3518164866/背景2` | `materials/workshop/3518164866/背景2.tex` |
+| `materials/sky.json` | `grid.png` | `materials/grid.png` |
+
+Resolution (verified across 75 packages): try `materials/{name}` with each
+candidate extension (`.tex`, `.png`, `.jpg`, `.jpeg`, `.tga`, `.bmp`); a name
+that already carries an extension is used verbatim, rooted at `materials/`.
+This single rule correctly resolves 475 references on the corpus (the 247 that
+fail are particle/preset textures that reference an unexported runtime asset,
+not an image the renderer needs).
+
+| Field | Source | Note |
+| --- | --- | --- |
+| `textures[]` root | `bytes` | Bare names resolve under `materials/`, corpus-verified |
+| extension candidates | `experiment` | `.tex` first, then common image formats |
+
 ### Format Enumeration
 - `0`, `1`, `28`: RGBA8 (uncompressed 32-bit `width * height * 4` bytes)
 - `2`, `29`: RGB8 (uncompressed 24-bit)

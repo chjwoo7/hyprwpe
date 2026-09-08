@@ -87,9 +87,21 @@ daemon.
 Ordered by wallpapers unlocked per unit of work.
 
 **1. Container, scene graph, image objects.** Parse `scene.pkg` and `scene.json`,
-build the object tree, draw image layers with transforms. 6 wallpapers render
-correctly on this alone (image-only, no effects), and all 75 render *something*
-if unsupported features are skipped.
+build the object tree, draw image layers with transforms.
+
+*Status (measured 2026-09, 75 packages, 723 image objects):* the image-object
+path is implemented end to end.
+- Texture-chain resolution (object -> `models/*.json` -> `materials/*.json`
+  -> `materials/<name>.tex`) resolves **413/723** image references.
+- Of those, **366 decode** to RGBA (embedded PNG/JPEG inside the `TEXV0005`
+  container decodes via the `image` crate; raw-BC payloads are best-effort).
+- **44/75 scenes have every image object decode**; **73/75** have at least one
+  image object decoding (so they show their background rather than nothing).
+
+The layout model validated against real scenes: object `origin` is the quad
+centre, quad extent is `size * scale` in design units, and `general.
+orthogonalprojection {width,height}` names the design canvas that is
+aspect-fitted to the output surface.
 
 **2. Particles.** 52/75 wallpapers. The largest single jump available.
 

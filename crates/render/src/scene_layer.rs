@@ -41,12 +41,22 @@ void main() {
 }
 "#;
 
-/// 2D Quad vertices: [posX, posY, texU, texV]
+/// 2D Quad vertices: [posX, posY, texU, texV].
+///
+/// The quad is modelled as a unit square centred on the object origin: the
+/// position spans `-1..1`, so scaling by `size * scale / 2` makes the full
+/// quad exactly `size * scale` world units, centred on the origin (this
+/// matches how Wallpaper Engine layers are authored). Texture V is inverted so
+/// row 0 of the uploaded image (the top) maps to the top of the quad under the
+/// y-up orthographic projection.
 const QUAD_VERTICES: [f32; 16] = [
-    // Triangle 1
-    0.0, 0.0, 0.0, 1.0,
-    1.0, 0.0, 1.0, 1.0,
-    0.0, 1.0, 0.0, 0.0,
+    // bottom-left  (position, uv)
+    -1.0, -1.0, 0.0, 1.0,
+    // bottom-right
+    1.0, -1.0, 1.0, 1.0,
+    // top-left
+    -1.0, 1.0, 0.0, 0.0,
+    // top-right
     1.0, 1.0, 1.0, 0.0,
 ];
 
@@ -144,10 +154,25 @@ pub struct ScenePlayer {
     loc_model: Option<glow::UniformLocation>,
     loc_color: Option<glow::UniformLocation>,
     layers: Vec<RenderLayer>,
+    /// Scene space the projection maps to the surface. `None` means "use the
+    /// surface size" (the scene does not declare an orthogonal canvas).
+    design: Option<(f32, f32)>,
+    /// Scene zoom applied on top of the aspect-fit projection.
+    zoom: f32,
     is_paused: bool,
 }
 
 impl ScenePlayer {
+    /// Design canvas for a scene: `general.orthogonalprojection`, defaulting to
+    /// the surface dimensions when the scene does not declare one.
+    fn design_canvas(scene: &Scene) -> Option<(f32, f32)> {
+        let general = scene.general.as_ref()?;
+        let ortho = general.orthogonalprojection.as_ref()?;
+        match (ortho.width, ortho.height) {
+            (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some((w, h)),
+            _ => None,
+        }
+    }
     /// Load a scene from a `scene.pkg` file or directory containing it.
     pub fn new(path: &Path, gl: &glow::Context) -> Result<Self> {
         let pkg_path = if path.is_dir() {
@@ -249,6 +274,13 @@ impl ScenePlayer {
                 }
             }
 
+            let design = Self::design_canvas(&scene);
+            let zoom = scene
+                .general
+                .as_ref()
+                .and_then(|g| g.zoom)
+                .unwrap_or(1.0);
+
             Ok(ScenePlayer {
                 program,
                 vao,
@@ -257,6 +289,8 @@ impl ScenePlayer {
                 loc_model,
                 loc_color,
                 layers,
+                design,
+                zoom,
                 is_paused: false,
             })
         }
@@ -281,8 +315,20 @@ impl ScenePlayer {
 
             gl.use_program(Some(self.program));
 
-            // Orthographic projection: (0, 0) bottom-left, (width, height) top-right
-            let proj = Mat4::ortho(0.0, width as f32, 0.0, height as f32, -1000.0, 1000.0);
+            // Projection: fit the scene's design canvas into the surface,
+            // preserving aspect (letterbox the remainder). Scenes lay objects
+            // out in design units (general.orthogonalprojection, e.g.
+            // 3840x2160); the camera centre is the canvas centre and object
+            // origins are canvas-relative. Without a declared canvas the
+            // design space is the surface size itself.
+            let (dw, dh) = match self.design {
+                Some((w, h)) => (w, h),
+                None => (width as f32, height as f32),
+            };
+            let fit = (width as f32 / dw).min(height as f32 / dh) * self.zoom;
+            let ox = (width as f32 - dw * fit) / 2.0;
+            let oy = (height as f32 - dh * fit) / 2.0;
+            let proj = Mat4::ortho(ox, ox + dw * fit, oy, oy + dh * fit, -1000.0, 1000.0);
             if let Some(loc) = &self.loc_projection {
                 gl.uniform_matrix_4_f32_slice(Some(loc), false, &proj.0);
             }
@@ -294,11 +340,16 @@ impl ScenePlayer {
                     continue;
                 }
 
-                // Compute layer model matrix:
-                // Translate to origin -> rotate -> scale to size
+                // Quad is a unit square centred on the object origin: translate
+                // to origin -> rotate about the centre -> scale by half-extent
+                // (the quad spans -1..1, so the full width/height is size*scale).
                 let t = Mat4::translate(layer.origin[0], layer.origin[1], layer.origin[2]);
                 let r = Mat4::rotate_z(layer.angles[2].to_radians());
-                let s = Mat4::scale(layer.width * layer.scale[0], layer.height * layer.scale[1], 1.0);
+                let s = Mat4::scale(
+                    layer.width * layer.scale[0] / 2.0,
+                    layer.height * layer.scale[1] / 2.0,
+                    1.0,
+                );
 
                 let model = t.mul(&r).mul(&s);
 
@@ -341,40 +392,122 @@ impl ScenePlayer {
     }
 }
 
-/// Resolves a texture file path from a material reference.
-fn resolve_texture_file(pkg: &Package, mat_path: &str) -> Option<String> {
-    if mat_path.ends_with(".tex")
-        || mat_path.ends_with(".png")
-        || mat_path.ends_with(".jpg")
-        || mat_path.ends_with(".jpeg")
-    {
-        return Some(mat_path.to_string());
+/// Resolve the actual texture bytes for a scene image object.
+///
+/// Wallpaper Engine scene objects reference their picture through a chain:
+///
+/// ```text
+/// scene.json "image" field
+///   -> models/<name>.json      { "material": "materials/<name>.json" }
+///   -> materials/<name>.json   { "passes": [{ "textures": ["<bare>"] }] }
+///   -> materials/<bare>.tex    (or .png / .jpg next to the material)
+/// ```
+///
+/// Each hop may be skipped when the reference already names a real file
+/// (`...png`, `...jpg`, `...tex`). A material-texture name (no extension, the
+/// dominant form in the corpus) resolves relative to the package `materials/`
+/// directory; see [`resolve_texture_entry`].
+fn resolve_texture_file(pkg: &Package, image_ref: &str) -> Option<String> {
+    if is_image_file(image_ref) {
+        return pkg
+            .get(image_ref)
+            .is_some()
+            .then(|| image_ref.to_string());
     }
 
-    if let Some(mat_str) = pkg.get_str(mat_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(mat_str) {
-            // Check passes[0].textures[0]
-            if let Some(arr) = json.get("passes").and_then(|p| p.get(0)).and_then(|p0| p0.get("textures")).and_then(|t| t.as_array()) {
-                if let Some(tex) = arr.first().and_then(|v| v.as_str()) {
-                    return Some(tex.to_string());
-                }
-            }
-            // Check textures[0]
-            if let Some(arr) = json.get("textures").and_then(|t| t.as_array()) {
-                if let Some(tex) = arr.first().and_then(|v| v.as_str()) {
-                    return Some(tex.to_string());
-                }
-            }
+    let body = pkg.get_str(image_ref)?;
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+
+    // A model JSON defers to a material; a material JSON lists textures
+    // directly. Both can appear in the scene graph's `image` field.
+    if let Some(material) = body.get("material").and_then(|m| m.as_str()) {
+        if is_image_file(material) {
+            return pkg
+                .get(material)
+                .is_some()
+                .then(|| material.to_string());
+        }
+        let mat = pkg.get_str(material)?;
+        let mat: serde_json::Value = serde_json::from_str(mat).ok()?;
+        material_texture_name(pkg, material, &mat)
+    } else {
+        material_texture_name(pkg, image_ref, &body)
+    }
+}
+
+/// Given a material JSON body (and its package path), resolve the first
+/// texture name it lists to a package entry path.
+fn material_texture_name(
+    pkg: &Package,
+    material_path: &str,
+    mat: &serde_json::Value,
+) -> Option<String> {
+    let texture_name = mat
+        .get("passes")
+        .and_then(|p| p.as_array())
+        .and_then(|p| p.first())
+        .and_then(|p0| p0.get("textures"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            mat.get("textures")
+                .and_then(|t| t.as_array())
+                .and_then(|t| t.first())
+                .and_then(|v| v.as_str())
+        })?;
+    resolve_texture_entry(pkg, material_path, texture_name)
+}
+
+fn is_image_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".tex")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".tga")
+        || lower.ends_with(".bmp")
+}
+
+/// Resolve a material texture name to a real package entry.
+///
+/// Corpus evidence (75 scene packages, 475 matching references): the names in
+/// `passes[].textures` / `textures[]` are **relative to the `materials/`
+/// directory**, so `"akalibackground2"` and `"workshop/3518.../背景2"` both
+/// resolve to `materials/<name>.tex` (or `.png`/`.jpg`). Handles a name that
+/// already carries an image extension too.
+fn resolve_texture_entry(pkg: &Package, material_path: &str, name: &str) -> Option<String> {
+    let _ = material_path;
+    if is_image_file(name) {
+        let rooted = format!("materials/{name}");
+        let direct = name.to_string();
+        return pkg
+            .get(&rooted)
+            .is_some()
+            .then(|| rooted)
+            .or_else(|| pkg.get(&direct).is_some().then(|| direct));
+    }
+    for ext in [".tex", ".png", ".jpg", ".jpeg", ".tga", ".bmp", ""] {
+        let cand = format!("materials/{name}{ext}");
+        if pkg.get(&cand).is_some() {
+            return Some(cand);
         }
     }
-
-    // Try fallback replacing .json with .tex
-    let tex_candidate = mat_path.replace(".json", ".tex");
-    if pkg.get(&tex_candidate).is_some() {
-        return Some(tex_candidate);
-    }
-
     None
+}
+
+/// Load the texture bytes for a resolved entry and decode to RGBA.
+///
+/// `.tex` files go through [`TexImage`] (which understands the `TEXV0005`
+/// container and its embedded PNG/JPEG payloads); other image formats decode
+/// directly through the `image` crate.
+fn load_texture_image(pkg: &Package, path: &str) -> Option<image::RgbaImage> {
+    let raw = pkg.get(path)?;
+    if path.ends_with(".tex") {
+        let tex = TexImage::parse(raw).ok()?;
+        return tex.to_rgba_image().ok();
+    }
+    image::load_from_memory(raw).ok().map(|i| i.to_rgba8())
 }
 
 /// Load and upload texture data from package to GPU.
@@ -383,17 +516,9 @@ unsafe fn load_texture_from_pkg(
     path: &str,
     gl: &glow::Context,
 ) -> Option<(glow::Texture, u32, u32)> {
-    let raw = pkg.get(path)?;
-
-    let (pixels, width, height) = if path.ends_with(".tex") {
-        let tex = TexImage::parse(raw).ok()?;
-        let rgba = tex.to_rgba8().ok()?;
-        (rgba, tex.width, tex.height)
-    } else {
-        let img = image::load_from_memory(raw).ok()?.to_rgba8();
-        let (w, h) = img.dimensions();
-        (img.into_raw(), w, h)
-    };
+    let img = load_texture_image(pkg, path)?;
+    let (width, height) = img.dimensions();
+    let pixels = img.into_raw();
 
     let texture = gl.create_texture().ok()?;
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -485,38 +610,60 @@ mod tests {
 
     #[test]
     fn resolve_texture_file_variations() {
-        // 1. Direct extensions
-        let pkg = make_test_pkg(&[]);
+        // 1. Direct image file present in the package.
+        let pkg = make_test_pkg(&[("textures/bg.tex", b"x")]);
         assert_eq!(
             resolve_texture_file(&pkg, "textures/bg.tex").as_deref(),
             Some("textures/bg.tex")
         );
+
+        // 2. Model JSON -> material JSON -> bare name -> materials/<name>.tex.
+        //    The texture name is relative to the package `materials/` dir.
+        let model = r#"{"material": "materials/forest.json"}"#;
+        let mat = r#"{"passes": [{"textures": ["forest"]}]}"#;
+        let pkg2 = make_test_pkg(&[
+            ("models/forest.json", model.as_bytes()),
+            ("materials/forest.json", mat.as_bytes()),
+            ("materials/forest.tex", b"tex-data"),
+        ]);
         assert_eq!(
-            resolve_texture_file(&pkg, "textures/bg.png").as_deref(),
-            Some("textures/bg.png")
+            resolve_texture_file(&pkg2, "models/forest.json").as_deref(),
+            Some("materials/forest.tex")
         );
 
-        // 2. Material with passes.textures
-        let mat_json = r#"{"passes": [{"textures": ["textures/forest.tex"]}]}"#;
-        let pkg2 = make_test_pkg(&[("materials/forest.json", mat_json.as_bytes())]);
-        assert_eq!(
-            resolve_texture_file(&pkg2, "materials/forest.json").as_deref(),
-            Some("textures/forest.tex")
-        );
-
-        // 3. Material with top-level textures
-        let mat_json3 = r#"{"textures": ["textures/sky.tex"]}"#;
-        let pkg3 = make_test_pkg(&[("materials/sky.json", mat_json3.as_bytes())]);
+        // 3. Material referenced directly by the scene (image == material path).
+        let mat3 = r#"{"textures": ["sky/clouds"]}"#;
+        let pkg3 = make_test_pkg(&[
+            ("materials/sky.json", mat3.as_bytes()),
+            ("materials/sky/clouds.tex", b"tex-data"),
+        ]);
         assert_eq!(
             resolve_texture_file(&pkg3, "materials/sky.json").as_deref(),
-            Some("textures/sky.tex")
+            Some("materials/sky/clouds.tex")
         );
 
-        // 4. Fallback .json -> .tex when present
-        let pkg4 = make_test_pkg(&[("materials/water.tex", b"dummy")]);
+        // 4. Agent fallback: model JSON references a `.json` material that
+        //    resolves to a sibling `.tex` only when such a file exists.
+        let model4 = r#"{"material": "materials/water.json"}"#;
+        let pkg4 = make_test_pkg(&[
+            ("models/water.json", model4.as_bytes()),
+            ("materials/water.json", br#"{}"#),
+            ("materials/water.tex", b"tex-data"),
+        ]);
         assert_eq!(
-            resolve_texture_file(&pkg4, "materials/water.json").as_deref(),
-            Some("materials/water.tex")
+            resolve_texture_file(&pkg4, "models/water.json").as_deref(),
+            None // material has no texture names, so nothing resolves
+        );
+
+        // 5. Textures key at top level with an extension name kept verbatim.
+        let mat5 = r#"{"textures": ["grid.png"]}"#;
+        let pkg5 = make_test_pkg(&[
+            ("materials/grid.json", mat5.as_bytes()),
+            ("materials/grid.png", b"png-data"),
+        ]);
+        assert_eq!(
+            resolve_texture_file(&pkg5, "materials/grid.json").as_deref(),
+            Some("materials/grid.png")
         );
     }
 

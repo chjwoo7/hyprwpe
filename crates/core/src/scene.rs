@@ -373,6 +373,28 @@ pub struct General {
     pub cameraparallaxamount: Option<f32>,
     #[serde(default, deserialize_with = "deserialize_opt_f32")]
     pub cameraparallaxdelay: Option<f32>,
+    /// The orthogonal projection canvas, when the scene uses one. Object
+    /// `origin` values live in this space; rendering maps this canvas to the
+    /// output, preserving aspect, so scenes are laid out in "design units"
+    /// rather than output pixels.
+    #[serde(default)]
+    pub orthogonalprojection: Option<OrthogonalProjection>,
+    #[serde(default, deserialize_with = "deserialize_opt_f32")]
+    pub zoom: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_opt_f32")]
+    pub nearz: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_opt_f32")]
+    pub farz: Option<f32>,
+}
+
+/// The `general.orthogonalprojection` object from a scene's scenario.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OrthogonalProjection {
+    #[serde(default)]
+    pub width: Option<f32>,
+    #[serde(default)]
+    pub height: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
