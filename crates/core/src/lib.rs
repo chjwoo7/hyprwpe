@@ -1,6 +1,7 @@
 //! Shared model for hyprwpe: what wallpapers exist and how to read them.
 
 pub mod catalog;
+pub mod client;
 pub mod config;
 pub mod pkg;
 pub mod protocol;

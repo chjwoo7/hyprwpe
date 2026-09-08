@@ -4,11 +4,11 @@
 //! subcommand is a thin client. Anything the GUI can do must be reachable here
 //! first.
 
-mod client;
 mod daemon;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use hyprwpe_core::client;
 use hyprwpe_core::protocol::{self, Request, Response};
 use hyprwpe_core::{config, Catalog, Kind, Source, WallpaperId};
 use hyprwpe_render::{Scaling, Wallpapers};

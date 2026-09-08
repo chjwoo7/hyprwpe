@@ -4,8 +4,8 @@
 //! the GUI will do must be reachable here first, so the CLI stays the reference
 //! implementation of the protocol.
 
+use crate::protocol::{self, Request, Response};
 use anyhow::{bail, Context, Result};
-use hyprwpe_core::protocol::{self, Request, Response};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 

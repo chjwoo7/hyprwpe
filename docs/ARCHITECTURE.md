@@ -124,9 +124,19 @@ GTK4 + libadwaita. The reason is not preference: matugen already generates
 palette with no theming code at all. A Qt or Iced GUI would need its own theme
 bridge.
 
-Shows the catalog as a thumbnail grid with type filters, per-monitor assignment,
-and a live status strip (state, RSS, CPU). The GUI is a separate process and
-costs nothing when closed.
+Shows the catalog as a thumbnail grid with kind filters, per-output assignment,
+and a status strip fed by the same `status` request the CLI uses.
+
+The grid is a `GridView`, not a `FlowBox`, because it recycles widgets: only a
+screenful of thumbnails is decoded at a time, and the texture is dropped as a
+tile scrolls away. Measured against the reference library, that is the
+difference between the catalog costing 53 MB and costing 6 MB, and it does not
+grow with library size.
+
+What is left is the toolkit. An empty catalog already costs 194 MB of GTK4 and
+libadwaita, so the picker's footprint is essentially fixed and almost none of it
+is ours. That is the argument for keeping the GUI a separate binary: the process
+that runs all session never links any of it.
 
 ### `hyprwpe-render` (renderers)
 
@@ -381,7 +391,7 @@ is no leak to chase. The wins are structural, not allocation tuning:
 | Battery profile | fps downshift or static image fallback |
 | First-party image renderer | The whole 263–654 MB and all CPU — a still frame needs neither |
 | First-party video renderer | To be measured against the 483–654 MB above |
-| GUI as a separate process | Zero cost when closed |
+| GUI as a separate process | 194 MB, the GTK4 runtime, paid only while the picker is open |
 
 The image row is the largest single lever and the easiest to reach. A static
 wallpaper through a Wallpaper Engine runtime pays the full cost of a live
