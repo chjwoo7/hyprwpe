@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use hyprwpe_core::protocol::OutputStatus;
+use hyprwpe_core::settings::{Assignment, State};
 use image::{imageops::FilterType, RgbaImage};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -134,6 +135,36 @@ impl Wallpapers {
             }
         }
         self.redraw_all();
+    }
+
+    /// Desired state in a form that survives a restart.
+    ///
+    /// Derived from what the renderer already holds rather than tracked
+    /// separately, so the file on disk cannot drift from what is on screen.
+    pub fn snapshot(&self) -> State {
+        State {
+            default: self.default_spec.as_ref().map(assignment),
+            outputs: self
+                .per_output
+                .iter()
+                .map(|(name, spec)| (name.clone(), assignment(spec)))
+                .collect(),
+        }
+    }
+
+    /// Apply a saved state. Per-output entries are applied after the default
+    /// because setting the default deliberately clears them.
+    pub fn restore(&mut self, state: &State) {
+        if let Some(a) = &state.default {
+            if let Some(spec) = spec_from(a) {
+                self.set(Target::All, spec);
+            }
+        }
+        for (name, a) in &state.outputs {
+            if let Some(spec) = spec_from(a) {
+                self.set(Target::Output(name.clone()), spec);
+            }
+        }
     }
 
     /// Names of the outputs currently known, for validating a client's target.
@@ -325,6 +356,22 @@ impl Wallpapers {
         self.cache = None;
         Ok(())
     }
+}
+
+fn assignment(spec: &WallpaperSpec) -> Assignment {
+    Assignment {
+        path: spec.path.clone(),
+        scaling: spec.scaling.as_str().to_string(),
+    }
+}
+
+/// An assignment whose scaling name is not recognised is dropped rather than
+/// guessed: a state file written by a newer version should degrade quietly.
+fn spec_from(a: &Assignment) -> Option<WallpaperSpec> {
+    Some(WallpaperSpec {
+        path: a.path.clone(),
+        scaling: Scaling::parse(&a.scaling)?,
+    })
 }
 
 /// Fill `canvas` with the scaled image. `canvas` is ARGB8888, which is BGRA in

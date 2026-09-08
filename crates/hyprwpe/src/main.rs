@@ -10,7 +10,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use hyprwpe_core::client;
 use hyprwpe_core::protocol::{self, Request, Response};
-use hyprwpe_core::{config, Catalog, Kind, Source, WallpaperId};
+use hyprwpe_core::settings::Config;
+use hyprwpe_core::{Catalog, Kind, Source, WallpaperId};
 use hyprwpe_render::{Scaling, Wallpapers};
 use std::path::{Path, PathBuf};
 
@@ -129,7 +130,7 @@ fn main() -> Result<()> {
 
 fn sources_from(paths: Vec<PathBuf>) -> Vec<Source> {
     if paths.is_empty() {
-        config::default_sources()
+        Config::load().sources()
     } else {
         paths.into_iter().map(source_for).collect()
     }
@@ -167,7 +168,7 @@ fn resolve(wallpaper: &str) -> Result<PathBuf> {
         return Ok(as_path.to_path_buf());
     }
 
-    let catalog = Catalog::scan(&config::default_sources());
+    let catalog = Catalog::scan(&Config::load().sources());
     let found = catalog.wallpapers.iter().find(|w| match &w.id {
         WallpaperId::Wpe(id) => id == wallpaper,
         WallpaperId::File(p) => p.as_os_str() == wallpaper,

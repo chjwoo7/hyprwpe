@@ -1,0 +1,24 @@
+# hyprwpe configuration — copy to ~/.config/hyprwpe/config.toml
+#
+# Everything here is optional. With no file at all, hyprwpe detects a Steam
+# Workshop directory and your Pictures folders, which is enough for most people.
+# hyprwpe never writes this file, so comments and hand-edits survive.
+
+# Scaling used when a request does not name one: fill, fit, stretch or center.
+default_scaling = "fill"
+
+# Wallpaper sources, scanned in order. Listing any source replaces detection
+# entirely, so include the Workshop directory here if you want it.
+#
+# `workshop` is a directory whose children carry project.json. Steam does not
+# need to be installed — it is just a directory shape. Steam libraries move
+# between drives, so point this at yours if detection guesses wrong.
+[[source]]
+kind = "workshop"
+path = "~/.steam/root/steamapps/workshop/content/431960"
+
+# `directory` is any folder of images, videos or shaders.
+[[source]]
+kind = "directory"
+path = "~/Pictures/Wallpapers"
+recursive = true

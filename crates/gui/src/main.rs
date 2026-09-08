@@ -12,7 +12,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use hyprwpe_core::client;
 use hyprwpe_core::protocol::{Request, Response, Status, Target};
-use hyprwpe_core::{config, Catalog, Kind};
+use hyprwpe_core::settings::Config;
+use hyprwpe_core::{Catalog, Kind};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
@@ -53,7 +54,7 @@ fn main() -> glib::ExitCode {
 
 fn build_ui(gtk_app: &adw::Application) {
     let app = Rc::new(App {
-        catalog: Catalog::scan(&config::default_sources()),
+        catalog: Catalog::scan(&Config::load().sources()),
         selection: RefCell::new(Selection {
             output: None,
             scaling: "fill".to_string(),

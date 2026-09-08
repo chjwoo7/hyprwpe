@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use hyprwpe_core::protocol::{self, Request, Response, Status};
+use hyprwpe_core::settings::State;
 use hyprwpe_render::{Scaling, Target, WallpaperSpec, Wallpapers};
 use smithay_client_toolkit::reexports::{
     calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction},
@@ -42,6 +43,13 @@ pub fn run() -> Result<()> {
     let (globals, queue) = registry_queue_init(&conn).context("initialising registry")?;
     let qh = queue.handle();
     let mut wallpapers = Wallpapers::new(&globals, &qh)?;
+
+    // Restore what the last session was showing. Without this, adding
+    // `exec-once = hyprwpe daemon` gets you a black screen at login, which is
+    // not a wallpaper daemon anyone can use.
+    let mut saved = State::load();
+    saved.prune_missing();
+    wallpapers.restore(&saved);
 
     let mut event_loop: EventLoop<Wallpapers> =
         EventLoop::try_new().context("creating the event loop")?;
@@ -138,6 +146,11 @@ fn handle(req: Request, state: &mut Wallpapers) -> Response {
         } => match prepare_set(&path, &target, &scaling, state) {
             Ok((target, spec)) => {
                 state.set(target, spec);
+                // Persist after applying, so a state file only ever describes
+                // something that actually worked.
+                if let Err(e) = state.snapshot().save() {
+                    eprintln!("hyprwpe: could not save state: {e:#}");
+                }
                 Response::Ok
             }
             Err(message) => Response::Error { message },
@@ -158,7 +171,7 @@ fn prepare_set(
     }
 
     let scaling =
-        parse_scaling(scaling).ok_or_else(|| format!("unknown scaling mode {scaling:?}"))?;
+        Scaling::parse(scaling).ok_or_else(|| format!("unknown scaling mode {scaling:?}"))?;
 
     let target = match target {
         protocol::Target::All => Target::All,
@@ -185,14 +198,4 @@ fn prepare_set(
             scaling,
         },
     ))
-}
-
-pub fn parse_scaling(s: &str) -> Option<Scaling> {
-    match s {
-        "fill" => Some(Scaling::Fill),
-        "fit" => Some(Scaling::Fit),
-        "stretch" => Some(Scaling::Stretch),
-        "center" => Some(Scaling::Center),
-        _ => None,
-    }
 }

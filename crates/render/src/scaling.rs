@@ -40,6 +40,18 @@ pub enum Scaling {
 }
 
 impl Scaling {
+    /// Inverse of [`Scaling::as_str`]. Lives here so the wire format, the CLI
+    /// and the state file cannot disagree about what the names mean.
+    pub fn parse(s: &str) -> Option<Scaling> {
+        match s {
+            "fill" => Some(Scaling::Fill),
+            "fit" => Some(Scaling::Fit),
+            "stretch" => Some(Scaling::Stretch),
+            "center" => Some(Scaling::Center),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Scaling::Fill => "fill",
@@ -95,6 +107,19 @@ pub fn place(mode: Scaling, src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_name_round_trips() {
+        for mode in [
+            Scaling::Fill,
+            Scaling::Fit,
+            Scaling::Stretch,
+            Scaling::Center,
+        ] {
+            assert_eq!(Scaling::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(Scaling::parse("nonsense"), None);
+    }
 
     #[test]
     fn stretch_matches_surface_exactly() {
