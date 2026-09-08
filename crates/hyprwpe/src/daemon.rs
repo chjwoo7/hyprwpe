@@ -17,6 +17,7 @@ use smithay_client_toolkit::reexports::{
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 use wayland_client::{globals::registry_queue_init, Connection};
 
 pub fn run() -> Result<()> {
@@ -94,10 +95,25 @@ pub fn run() -> Result<()> {
     result
 }
 
+/// How long a client has to send its request before the daemon gives up on it.
+///
+/// This runs inside the event loop, so a client that connects and says nothing
+/// would otherwise stop the daemon dead — no further requests, and no Wayland
+/// events either, which means no response to hotplug or reconfiguration. A
+/// crashed client mid-request is enough to trigger it. Generous for a local
+/// socket, short enough that nothing notices.
+const CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Handle one request and close. Connections are not kept open: the protocol is
 /// request/response and clients are short-lived, so there is no session state to
 /// track and a wedged client cannot hold the daemon.
 fn serve(stream: UnixStream, state: &mut Wallpapers) {
+    if let Err(e) = stream.set_read_timeout(Some(CLIENT_TIMEOUT)) {
+        eprintln!("hyprwpe: setting client timeout: {e}");
+        return;
+    }
+    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
+
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -107,7 +123,10 @@ fn serve(stream: UnixStream, state: &mut Wallpapers) {
     });
     let mut line = String::new();
     if let Err(e) = reader.read_line(&mut line) {
-        eprintln!("hyprwpe: reading request: {e}");
+        // A silent client is dropped rather than waited on.
+        if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::TimedOut {
+            eprintln!("hyprwpe: reading request: {e}");
+        }
         return;
     }
 
