@@ -315,17 +315,17 @@ impl ScenePlayer {
 
             gl.use_program(Some(self.program));
 
-            // Projection: fit the scene's design canvas into the surface,
-            // preserving aspect (letterbox the remainder). Scenes lay objects
-            // out in design units (general.orthogonalprojection, e.g.
-            // 3840x2160); the camera centre is the canvas centre and object
-            // origins are canvas-relative. Without a declared canvas the
-            // design space is the surface size itself.
+            // Projection: fit the scene's design canvas to the surface using
+            // COVER semantics (scale up until the canvas fills the output,
+            // cropping the overflow), matching how wallpaper engines present
+            // a non-matching aspect ratio. Letterboxing would show black bars,
+            // which reads as a broken wallpaper. Object origins are
+            // canvas-relative; the canvas is centred on the output.
             let (dw, dh) = match self.design {
                 Some((w, h)) => (w, h),
                 None => (width as f32, height as f32),
             };
-            let fit = (width as f32 / dw).min(height as f32 / dh) * self.zoom;
+            let fit = (width as f32 / dw).max(height as f32 / dh) * self.zoom;
             let ox = (width as f32 - dw * fit) / 2.0;
             let oy = (height as f32 - dh * fit) / 2.0;
             let proj = Mat4::ortho(ox, ox + dw * fit, oy, oy + dh * fit, -1000.0, 1000.0);
@@ -503,11 +503,21 @@ fn resolve_texture_entry(pkg: &Package, material_path: &str, name: &str) -> Opti
 /// directly through the `image` crate.
 fn load_texture_image(pkg: &Package, path: &str) -> Option<image::RgbaImage> {
     let raw = pkg.get(path)?;
-    if path.ends_with(".tex") {
+    let img = if path.ends_with(".tex") {
         let tex = TexImage::parse(raw).ok()?;
-        return tex.to_rgba_image().ok();
+        tex.to_rgba_image().ok()?
+    } else {
+        image::load_from_memory(raw).ok()?.to_rgba8()
+    };
+    // A degenerate decode (1px wide/tall, or wildly mismatched) is almost
+    // always a mis-parse of an unsupported .tex sub-format. Uploading it and
+    // stretching it across the layer's quad paints coloured scanline noise, so
+    // refuse it here and let the layer be skipped.
+    let (w, h) = img.dimensions();
+    if w <= 1 || h <= 1 || w > 16384 || h > 16384 {
+        return None;
     }
-    image::load_from_memory(raw).ok().map(|i| i.to_rgba8())
+    Some(img)
 }
 
 /// Load and upload texture data from package to GPU.

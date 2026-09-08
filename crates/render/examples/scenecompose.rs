@@ -68,11 +68,19 @@ fn resolve_texture_file(pkg: &Package, image_ref: &str) -> Option<String> {
 
 fn load_rgba(pkg: &Package, path: &str) -> Option<RgbaImage> {
     let raw = pkg.get(path)?;
-    if path.ends_with(".tex") {
+    let img = if path.ends_with(".tex") {
         let tex = TexImage::parse(raw).ok()?;
-        return tex.to_rgba_image().ok();
+        tex.to_rgba_image().ok()?
+    } else {
+        image::load_from_memory(raw).ok()?.to_rgba8()
+    };
+    // Mirror scene_layer's guard: refuse degenerate decodes that would paint
+    // stretched scanline noise instead of a layer.
+    let (w, h) = img.dimensions();
+    if w <= 1 || h <= 1 || w > 16384 || h > 16384 {
+        return None;
     }
-    image::load_from_memory(raw).ok().map(|i| i.to_rgba8())
+    Some(img)
 }
 
 struct Layer {
@@ -119,7 +127,7 @@ fn main() {
         .unwrap_or(1.0) as f32;
 
     // Fit design canvas into output preserving aspect, honouring zoom.
-    let fit = (out_w as f32 / dw).min(out_h as f32 / dh) * zoom;
+    let fit = (out_w as f32 / dw).max(out_h as f32 / dh) * zoom; // COVER: crop overflow, fill output
     let ox = (out_w as f32 - dw * fit) / 2.0;
     let oy = (out_h as f32 - dh * fit) / 2.0;
     println!("design canvas {dw}x{dh} zoom {zoom} -> output {out_w}x{out_h}, fit scale {fit}");

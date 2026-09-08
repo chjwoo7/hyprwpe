@@ -201,83 +201,14 @@ impl TexImage {
             });
         }
 
-        // No embedded image: raw BC data. Dimensions come from the TEXI block,
-        // which stores width/height as 16.16 fixed-point (x * 256).
-        let (mut width, mut height) = read_texi_dims(bytes)?;
-
-        // Inner TEXB header (after the 8-byte magic) has, in the common case:
-        //   u32 0x100            fixed 1.0
-        //   u32 format_high      e.g. 0x100 or 0xd00
-        //   u32 width << 8
-        //   u32 height << 8
-        // Try to refine dims from the inner header when the outer one is 0.
-        if let Some(tb) = find_texb(bytes) {
-            let inner = &bytes[tb + 8..];
-            if inner.len() >= 16 {
-                let w = u32::from_le_bytes(inner[8..12].try_into().unwrap()) >> 8;
-                let h = u32::from_le_bytes(inner[12..16].try_into().unwrap()) >> 8;
-                if w > 0 && h > 0 && w < 1 << 20 && h < 1 << 20 {
-                    width = w;
-                    height = h;
-                }
-            }
-        }
-
-        // Locate pixel data: skip the inner TEXB magic and its fixed header.
-        // We conservatively require at least the dims block, then treat the
-        // rest as raw BC. The exact header length for raw BC is not fully
-        // determined from the corpus; attempt a scan: pixel data must be at a
-        // 4-byte boundary after the header, and its size should match a known
-        // block format for the declared dimensions.
-        let Some(tb) = find_texb(bytes) else {
-            bail!("TEXV0005 with no TEXB payload");
-        };
-
-        // Recompute from the inner header when possible.
-        let inner = &bytes[tb + 8..];
-        let mut format = TexFormat::Unknown(0);
-
-        if inner.len() >= 4 {
-            let f0 = u32::from_le_bytes(inner[0..4].try_into().unwrap());
-            let f1 = inner
-                .get(4..8)
-                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
-                .unwrap_or(0);
-            // The second inner u32 often carries the DXGI-style format id in
-            // its low byte(s). Recognise the common ones.
-            format = TexFormat::from_u32(f1 & 0xff).or_else(|| TexFormat::from_u32(f0 & 0xff));
-        }
-
-        // Heuristic: find a payload start where the remaining length equals a
-        // plausible block count for width x height. This pins the header
-        // length without assuming it.
-        let mut best = None;
-        for probe in (0..inner.len().min(64)).step_by(4) {
-            let candidate = tb + 8 + probe;
-            let rest = bytes.len() - candidate;
-            for (fmt, bps) in [
-                (TexFormat::Dxt1, 8u64),
-                (TexFormat::Dxt3, 16),
-                (TexFormat::Dxt5, 16),
-            ] {
-                if rest as u64 == blocks_for(width, height) * bps {
-                    best = Some((candidate, fmt));
-                    break;
-                }
-            }
-            if best.is_some() {
-                break;
-            }
-        }
-
-        let (data_start, format) = match best {
-            Some((start, fmt)) => (start, fmt),
-            None => {
-                // Unknown raw layout: keep the whole inner payload as-is and
-                // let to_rgba8 report what is wrong.
-                (tb + 8, format)
-            }
-        };
+        // No embedded image: raw pixel/block data. Wallpaper Engine TEX headers
+        // store the size in more than one place and the layout differs between
+        // revisions (some store w/h * 256, some raw). The only consistent
+        // ground truth is the payload bytes themselves: for block-compressed
+        // data, `ceil(w/4)*ceil(h/4)` blocks occupy a known byte count. So we
+        // collect candidate (w, h) pairs from every plausible header field and
+        // keep the one whose payload length exactly matches a known format.
+        let (width, height, data_start, format) = dims_from_payload(bytes)?;
 
         Ok(TexImage {
             width,
@@ -345,30 +276,77 @@ impl TexImage {
     }
 }
 
-/// Extract width/height from a `TEXI` info block (16.16 fixed point, i.e.
-/// stored value / 256). Falls back to scanning for the first plausible pair.
-fn read_texi_dims(bytes: &[u8]) -> Result<(u32, u32)> {
-    // The TEXI block sits right after the 8-byte magic + 1 pad byte in the
-    // files observed; its data starts at offset 17 in those files. Fields:
-    // [0]=0 [1]=512 [2]=w<<8 [3]=h<<8 (some files repeat w,h in [4],[5]).
-    if bytes.len() >= 25 {
-        let f2 = u32::from_le_bytes(bytes[25..29].try_into().unwrap()) >> 8;
-        let f3 = u32::from_le_bytes(bytes[29..33].try_into().unwrap()) >> 8;
-        if f2 > 0 && f3 > 0 && f2 < (1 << 20) && f3 < (1 << 20) {
-            return Ok((f2, f3));
-        }
-    }
-    // Fallback scan: find two consecutive u32s that look like width/height.
-    let mut i = 16;
-    while i + 8 <= bytes.len() {
+/// Determine dimensions and payload layout for a `TEXV0005` with no embedded
+/// image, by validating candidate (width, height) pairs against the actual
+/// payload byte count.
+///
+/// Header layouts in the corpus are inconsistent: some revisions store
+/// dimensions as 16.16 fixed-point (`value * 256`), some store them raw, and
+/// the TEXB sub-block can precede the pixels with a header of varying length.
+/// The one invariant is the payload itself: for a block-compressed texture,
+/// `ceil(w/4) * ceil(h/4)` blocks occupy `bytes_per_block` each, and for
+/// uncompressed RGBA/R8 the bytes are `w * h * bpp`. So every candidate pair
+/// whose remaining bytes (from some plausible payload start) exactly match a
+/// known encoding is accepted.
+fn dims_from_payload(bytes: &[u8]) -> Result<(u32, u32, usize, TexFormat)> {
+    let Some(tb) = find_texb(bytes) else {
+        bail!("TEXV0005 with no TEXB payload");
+    };
+    // Search the header region after the TEXB magic for (w, h) candidates.
+    let header_end = (tb + 8 + 96).min(bytes.len());
+
+    let mut candidates: Vec<(u32, u32)> = Vec::new();
+    let mut i = 17usize;
+    while i + 8 <= header_end {
         let a = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
         let b = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap());
-        if a > 0 && b > 0 && a < (1 << 20) && b < (1 << 20) {
-            return Ok((a, b));
+        // Raw and 16.16 forms.
+        for (w, h) in [(a, b), (a >> 8, b >> 8), (b, a), (b >> 8, a >> 8)] {
+            if (1..=1 << 15).contains(&w) && (1..=1 << 15).contains(&h) {
+                candidates.push((w, h));
+            }
         }
         i += 4;
     }
-    bail!("could not find width/height in TEXV0005 header")
+
+    // Payload starts: any 4-byte boundary shortly after the TEXB magic.
+    let starts: Vec<usize> = (0..header_end - (tb + 8))
+        .step_by(4)
+        .map(|o| tb + 8 + o)
+        .collect();
+
+    let encodings: [(TexFormat, u64); 5] = [
+        (TexFormat::Dxt1, 8),
+        (TexFormat::Dxt5, 16),
+        (TexFormat::Dxt3, 16),
+        // RGBA8 / R8 raw: bpp 4 / 1
+        (TexFormat::Rgba8, 4),
+        (TexFormat::R8, 1),
+    ];
+
+    // Prefer block formats first (they are the common case), then raw.
+    for (fmt, bpp) in encodings.iter() {
+        for &(w, h) in &candidates {
+            let want = if matches!(fmt, TexFormat::Rgba8 | TexFormat::R8) {
+                (w as u64) * (h as u64) * bpp
+            } else {
+                blocks_for(w, h) * bpp
+            };
+            for &start in &starts {
+                let rest = bytes.len() - start;
+                if rest as u64 == want {
+                    return Ok((w, h, start, *fmt));
+                }
+            }
+        }
+    }
+
+    // No exact match: fall back to the first plausible header dims and leave
+    // the whole TEXB payload as-is; to_rgba8 will report what is wrong.
+    if let Some(&(w, h)) = candidates.first() {
+        return Ok((w, h, tb + 8, TexFormat::Dxt5));
+    }
+    bail!("could not determine .tex dimensions from payload")
 }
 
 fn blocks_for(width: u32, height: u32) -> u64 {
@@ -693,18 +671,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_texi_dims_from_v5_header() {
-        // Reconstruct the observed TEXV0005 header prefix for a 256x256 tex:
-        // magic TEXV0005, 0x00, TEXI0001, flags 0, 512?, w<<8, h<<8.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"TEXV0005");
-        bytes.push(0);
-        bytes.extend_from_slice(b"TEXI0001");
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&512u32.to_le_bytes());
-        bytes.extend_from_slice(&(256u32 << 8).to_le_bytes());
-        bytes.extend_from_slice(&(256u32 << 8).to_le_bytes());
-        let (w, h) = read_texi_dims(&bytes).expect("dims");
-        assert_eq!((w, h), (256, 256));
+    fn parse_dims_from_v5_payload() {
+        // A TEXV0005 containing a raw DXT5 payload: the pixel data is exactly
+        // ceil(32/4)*ceil(32/4) blocks * 16 bytes = 8*8*16 = 1024 bytes.
+        let mut header = Vec::new();
+        header.extend_from_slice(b"TEXV0005");
+        header.push(0);
+        header.extend_from_slice(b"TEXI0001");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&512u32.to_le_bytes());
+        header.extend_from_slice(&(32u32 << 8).to_le_bytes()); // w * 256
+        header.extend_from_slice(&(32u32 << 8).to_le_bytes()); // h * 256
+        // Inner sub-block with a plausible header + DXT5 payload.
+        header.extend_from_slice(b"TEXB0003");
+        header.extend_from_slice(&0x100u32.to_le_bytes());
+        header.extend_from_slice(&0xffffffffu32.to_le_bytes());
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&32u32.to_le_bytes()); // w
+        header.extend_from_slice(&32u32.to_le_bytes()); // h
+        header.extend_from_slice(&1u32.to_le_bytes()); // mip count
+        header.extend_from_slice(&1024u32.to_le_bytes()); // data length
+        header.extend_from_slice(&[0u8; 1024]); // DXT5 pixels (all opaque)
+
+        let tex = TexImage::parse(&header).expect("parse");
+        assert_eq!((tex.width, tex.height), (32, 32));
+        assert_eq!(tex.format, TexFormat::Dxt5);
+        let rgba = tex.to_rgba8().expect("decode dxt5");
+        assert_eq!(rgba.len(), 32 * 32 * 4);
     }
 }
