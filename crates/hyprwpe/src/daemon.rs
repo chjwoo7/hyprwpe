@@ -9,16 +9,29 @@
 use anyhow::{bail, Context, Result};
 use hyprwpe_core::protocol::{self, Request, Response, Status};
 use hyprwpe_core::settings::State;
+use hyprwpe_core::Kind;
 use hyprwpe_render::{Scaling, Target, WallpaperSpec, Wallpapers};
 use smithay_client_toolkit::reexports::{
     calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction},
     calloop_wayland_source::WaylandSource,
 };
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 use wayland_client::{globals::registry_queue_init, Connection};
+
+use crate::policy::{PolicyAction, PolicyEngine};
+
+fn apply_action(action: PolicyAction, wallpapers: &mut Wallpapers) {
+    match action {
+        PolicyAction::Pause => wallpapers.pause(),
+        PolicyAction::Resume => wallpapers.resume(),
+        PolicyAction::None => {}
+    }
+}
 
 pub fn run() -> Result<()> {
     let sock = protocol::socket_path();
@@ -43,7 +56,7 @@ pub fn run() -> Result<()> {
         .context("connecting to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
     let (globals, queue) = registry_queue_init(&conn).context("initialising registry")?;
     let qh = queue.handle();
-    let mut wallpapers = Wallpapers::new(&globals, &qh)?;
+    let mut wallpapers = Wallpapers::new(&conn, &globals, &qh)?;
 
     // Restore what the last session was showing. Without this, adding
     // `exec-once = hyprwpe daemon` gets you a black screen at login, which is
@@ -60,14 +73,53 @@ pub fn run() -> Result<()> {
         .insert(handle.clone())
         .map_err(|e| anyhow::anyhow!("inserting the wayland source: {e}"))?;
 
+    let policy = Rc::new(RefCell::new(PolicyEngine::new()));
+    policy.borrow_mut().sync_from_hyprland();
+
+    // Listen to Hyprland's socket2 event stream if Hyprland is the compositor.
+    if let Some(hypr_stream) = hyprwpe_core::hyprland::connect_event_stream() {
+        let read_stream = match hypr_stream.try_clone() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("hyprwpe: cloning Hyprland event socket: {e}");
+                None
+            }
+        };
+        if let Some(read_stream) = read_stream {
+            let mut reader = hyprwpe_core::hyprland::EventReader::new(read_stream);
+            let policy_hypr = Rc::clone(&policy);
+            if let Err(e) = handle.insert_source(
+                Generic::new(hypr_stream, Interest::READ, Mode::Level),
+                move |_, _, state: &mut Wallpapers| {
+                    let events = reader.poll();
+                    let mut pol = policy_hypr.borrow_mut();
+                    for event in events {
+                        let action = pol.handle_event(&event);
+                        apply_action(action, state);
+                    }
+                    if reader.is_eof() {
+                        eprintln!("hyprwpe: Hyprland event socket closed");
+                        return Ok(PostAction::Remove);
+                    }
+                    Ok(PostAction::Continue)
+                },
+            ) {
+                eprintln!("hyprwpe: inserting Hyprland event source: {e}");
+            }
+        }
+    } else {
+        eprintln!("hyprwpe: Hyprland socket2 not detected; running without compositor occlusion detection");
+    }
+
+    let policy_ipc = Rc::clone(&policy);
     handle
         .insert_source(
             Generic::new(listener, Interest::READ, Mode::Level),
-            |_, listener, state: &mut Wallpapers| {
+            move |_, listener, state: &mut Wallpapers| {
                 // Level-triggered, so drain everything pending before returning.
                 loop {
                     match listener.accept() {
-                        Ok((stream, _)) => serve(stream, state),
+                        Ok((stream, _)) => serve(stream, state, &policy_ipc),
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
                             eprintln!("hyprwpe: accept failed: {e}");
@@ -82,9 +134,12 @@ pub fn run() -> Result<()> {
 
     let result = (|| -> Result<()> {
         while !wallpapers.should_exit() {
+            let timeout = policy.borrow().pending_timeout();
             event_loop
-                .dispatch(None, &mut wallpapers)
+                .dispatch(timeout, &mut wallpapers)
                 .context("event loop dispatch")?;
+            let action = policy.borrow_mut().tick();
+            apply_action(action, &mut wallpapers);
         }
         Ok(())
     })();
@@ -107,7 +162,7 @@ const CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Handle one request and close. Connections are not kept open: the protocol is
 /// request/response and clients are short-lived, so there is no session state to
 /// track and a wedged client cannot hold the daemon.
-fn serve(stream: UnixStream, state: &mut Wallpapers) {
+fn serve(stream: UnixStream, state: &mut Wallpapers, policy: &Rc<RefCell<PolicyEngine>>) {
     if let Err(e) = stream.set_read_timeout(Some(CLIENT_TIMEOUT)) {
         eprintln!("hyprwpe: setting client timeout: {e}");
         return;
@@ -131,7 +186,7 @@ fn serve(stream: UnixStream, state: &mut Wallpapers) {
     }
 
     let response = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(req) => handle(req, state),
+        Ok(req) => handle(req, state, policy),
         Err(e) => Response::Error {
             message: format!("malformed request: {e}"),
         },
@@ -144,7 +199,7 @@ fn serve(stream: UnixStream, state: &mut Wallpapers) {
     }
 }
 
-fn handle(req: Request, state: &mut Wallpapers) -> Response {
+fn handle(req: Request, state: &mut Wallpapers, policy: &Rc<RefCell<PolicyEngine>>) -> Response {
     match req {
         Request::Ping => Response::Ok,
 
@@ -153,8 +208,21 @@ fn handle(req: Request, state: &mut Wallpapers) -> Response {
             Response::Ok
         }
 
+        Request::Pause => {
+            let action = policy.borrow_mut().set_manual_pause(true);
+            apply_action(action, state);
+            Response::Ok
+        }
+
+        Request::Resume => {
+            let action = policy.borrow_mut().set_manual_pause(false);
+            apply_action(action, state);
+            Response::Ok
+        }
+
         Request::Status => Response::Status(Status {
             outputs: state.status(),
+            paused: policy.borrow().is_paused() || state.is_paused(),
             rss_kb: protocol::self_rss_kb(),
         }),
 
@@ -192,6 +260,15 @@ fn prepare_set(
     let scaling =
         Scaling::parse(scaling).ok_or_else(|| format!("unknown scaling mode {scaling:?}"))?;
 
+    let kind = Kind::from_extension(path)
+        .ok_or_else(|| format!("{} is not a wallpaper hyprwpe can render", path.display()))?;
+    if !matches!(kind, Kind::Image | Kind::Video | Kind::Shader | Kind::Scene) {
+        return Err(format!(
+            "hyprwpe cannot render {} wallpapers yet",
+            kind.as_str()
+        ));
+    }
+
     let target = match target {
         protocol::Target::All => Target::All,
         protocol::Target::Output(name) => {
@@ -215,6 +292,7 @@ fn prepare_set(
         WallpaperSpec {
             path: path.to_path_buf(),
             scaling,
+            kind,
         },
     ))
 }

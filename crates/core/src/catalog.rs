@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "avif", "bmp", "svg", "gif"];
 pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv", "avi", "mov"];
 pub const SHADER_EXTS: &[&str] = &["glsl", "frag"];
+pub const SCENE_EXTS: &[&str] = &["pkg"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -37,7 +38,9 @@ impl Kind {
         }
     }
 
-    fn from_extension(path: &Path) -> Option<Kind> {
+    /// Which renderer a file needs, from its extension. The daemon uses this
+    /// so a `set` request stays just a path.
+    pub fn from_extension(path: &Path) -> Option<Kind> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         let has = |set: &[&str]| set.contains(&ext.as_str());
         if has(IMAGE_EXTS) {
@@ -46,6 +49,8 @@ impl Kind {
             Some(Kind::Video)
         } else if has(SHADER_EXTS) {
             Some(Kind::Shader)
+        } else if has(SCENE_EXTS) {
+            Some(Kind::Scene)
         } else {
             None
         }
@@ -87,6 +92,10 @@ pub struct Wallpaper {
     pub kind: Kind,
     /// Directory for a Workshop item, file for anything else.
     pub path: PathBuf,
+    /// The file a renderer opens. For a plain file this is `path`; for a
+    /// Workshop item it is the `file` named in `project.json`, which is the
+    /// only thing that says which of the item's files is the wallpaper.
+    pub media: Option<PathBuf>,
     /// Still image representing the wallpaper, when one exists.
     pub preview: Option<PathBuf>,
 }
@@ -96,7 +105,15 @@ impl Wallpaper {
     /// wallpaper the user owns should appear in listings even when unsupported,
     /// with the reason visible.
     pub fn supported(&self) -> bool {
-        self.kind != Kind::Web
+        match self.kind {
+            Kind::Image => true,
+            // Renderable only if the item actually names a file we found. A
+            // scene declaring itself with no package is listed but not offered.
+            Kind::Video => self.media.is_some(),
+            Kind::Shader => true,
+            Kind::Scene => self.media.is_some(),
+            Kind::Web => false,
+        }
     }
 }
 
@@ -118,6 +135,9 @@ struct Project {
     #[serde(rename = "type")]
     ty: Option<String>,
     preview: Option<String>,
+    /// The wallpaper's own file, relative to the item directory: the video for
+    /// a video wallpaper, `scene.pkg` for a scene, `index.html` for web.
+    file: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -196,12 +216,21 @@ impl Catalog {
             })?;
 
         let preview = project.preview.map(|p| dir.join(p)).filter(|p| p.exists());
+        let media = project
+            .file
+            .map(|f| dir.join(f))
+            .filter(|p| p.exists())
+            .or_else(|| {
+                let pkg = dir.join("scene.pkg");
+                pkg.exists().then_some(pkg)
+            });
 
         Ok(Wallpaper {
             title: project.title.unwrap_or_else(|| id.clone()),
             id: WallpaperId::Wpe(id),
             kind,
             path: dir.to_path_buf(),
+            media,
             preview,
         })
     }
@@ -235,6 +264,7 @@ impl Catalog {
                 id: WallpaperId::File(path.clone()),
                 title,
                 kind,
+                media: Some(path.clone()),
                 path,
                 preview,
             });
@@ -265,6 +295,10 @@ mod tests {
     fn kind_from_extension_is_case_insensitive() {
         assert_eq!(Kind::from_extension(Path::new("a.PNG")), Some(Kind::Image));
         assert_eq!(Kind::from_extension(Path::new("a.Mp4")), Some(Kind::Video));
+        assert_eq!(Kind::from_extension(Path::new("a.GLSL")), Some(Kind::Shader));
+        assert_eq!(Kind::from_extension(Path::new("a.frag")), Some(Kind::Shader));
+        assert_eq!(Kind::from_extension(Path::new("scene.pkg")), Some(Kind::Scene));
+        assert_eq!(Kind::from_extension(Path::new("a.PKG")), Some(Kind::Scene));
         assert_eq!(Kind::from_extension(Path::new("a.txt")), None);
         assert_eq!(Kind::from_extension(Path::new("noext")), None);
     }
@@ -284,8 +318,54 @@ mod tests {
             title: "t".into(),
             kind: Kind::Web,
             path: PathBuf::new(),
+            media: None,
             preview: None,
         };
         assert!(!w.supported());
+    }
+
+    /// A Workshop item can declare a type and ship nothing to render. Listing
+    /// it is right; offering it is not.
+    #[test]
+    fn a_video_without_its_file_is_not_supported() {
+        let mut w = Wallpaper {
+            id: WallpaperId::Wpe("2".into()),
+            title: "t".into(),
+            kind: Kind::Video,
+            path: PathBuf::new(),
+            media: None,
+            preview: None,
+        };
+        assert!(!w.supported());
+        w.media = Some(PathBuf::from("/tmp/x.mp4"));
+        assert!(w.supported());
+    }
+
+    #[test]
+    fn shader_is_supported() {
+        let w = Wallpaper {
+            id: WallpaperId::File(PathBuf::from("stars.frag")),
+            title: "Stars".into(),
+            kind: Kind::Shader,
+            path: PathBuf::from("stars.frag"),
+            media: Some(PathBuf::from("stars.frag")),
+            preview: None,
+        };
+        assert!(w.supported());
+    }
+
+    #[test]
+    fn scene_is_supported() {
+        let mut w = Wallpaper {
+            id: WallpaperId::Wpe("3".into()),
+            title: "Nature Scene".into(),
+            kind: Kind::Scene,
+            path: PathBuf::from("/tmp/3"),
+            media: None,
+            preview: None,
+        };
+        assert!(!w.supported());
+        w.media = Some(PathBuf::from("/tmp/3/scene.pkg"));
+        assert!(w.supported());
     }
 }

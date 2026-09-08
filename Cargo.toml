@@ -12,6 +12,11 @@ repository = "https://github.com/chjwoo7/hyprwpe"
 hyprwpe-core = { path = "crates/core" }
 hyprwpe-render = { path = "crates/render" }
 smithay-client-toolkit = "0.21"
+khronos-egl = { version = "6", features = ["dynamic"] }
+wayland-egl = "0.32"
+glow = "0.18"
+libmpv-sys = "3.1"
+libloading = "0.8"
 wayland-client = "0.31"
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }

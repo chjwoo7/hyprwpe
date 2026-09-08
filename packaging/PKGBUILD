@@ -1,0 +1,65 @@
+# Maintainer: chjwoo <chjwoo7@users.noreply.github.com>
+pkgname=hyprwpe
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Resource-efficient Wallpaper Engine and live wallpaper daemon for Hyprland"
+arch=('x86_64' 'aarch64')
+url="https://github.com/chjwoo7/hyprwpe"
+license=('MIT')
+depends=(
+    'wayland'
+    'libglvnd'
+    'gtk4'
+    'libadwaita'
+)
+optdepends=(
+    'mpv: hardware-accelerated video wallpaper playback'
+)
+makedepends=(
+    'cargo'
+    'pkgconf'
+    'wayland-protocols'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --all-targets
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    # Binaries
+    install -Dm755 "target/release/hyprwpe" "$pkgdir/usr/bin/hyprwpe"
+    install -Dm755 "target/release/hyprwpe-gui" "$pkgdir/usr/bin/hyprwpe-gui"
+
+    # Desktop Entry
+    install -Dm644 "packaging/hyprwpe.desktop" "$pkgdir/usr/share/applications/hyprwpe.desktop"
+
+    # License
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # Integration snippets
+    install -Dm644 "integration/hypr/hyprwpe.conf" "$pkgdir/usr/share/hyprwpe/hyprwpe.conf"
+    install -Dm644 "integration/quickshell/ExternalWallpaperDetector.qml" "$pkgdir/usr/share/hyprwpe/quickshell/ExternalWallpaperDetector.qml"
+    install -Dm644 "integration/quickshell/patch-background.diff" "$pkgdir/usr/share/hyprwpe/quickshell/patch-background.diff"
+
+    # Documentation
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

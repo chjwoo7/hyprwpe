@@ -1,0 +1,18 @@
+--- a/modules/background/Background.qml
++++ b/modules/background/Background.qml
+@@ -15,6 +15,10 @@ Scope {
+         layer: Scope.Background
+
++        property bool externalOwner: Config.background.externalWallpaperSocket !== undefined
++                                  && Config.background.externalWallpaperSocket !== ""
++                                  && FileUtils.exists(Config.background.externalWallpaperSocket)
++
+         Image {
+             id: wallpaper
+             anchors.fill: parent
+             fillMode: Image.PreserveAspectCrop
+-            visible: true
++            visible: !externalOwner
+             source: Config.background.wallpaperPath
+         }
+     }

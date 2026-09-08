@@ -36,7 +36,16 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
+use std::sync::Arc;
+
+use crate::gl::{GlSurface, ProcResolver, Renderer};
+use crate::mpv_dl::Mpv;
 use crate::scaling::{place, Scaling};
+use crate::scene_layer::ScenePlayer;
+use crate::shader_layer::ShaderPlayer;
+use crate::video_layer::VideoPlayer;
+use hyprwpe_core::Kind;
+use smithay_client_toolkit::compositor::FrameCallbackData;
 
 /// The layer to anchor to.
 ///
@@ -51,6 +60,7 @@ pub const WALLPAPER_LAYER: Layer = Layer::Background;
 pub struct WallpaperSpec {
     pub path: PathBuf,
     pub scaling: Scaling,
+    pub kind: Kind,
 }
 
 /// Which outputs a change applies to.
@@ -63,11 +73,35 @@ pub enum Target {
 }
 
 /// Identifies a painted result, so an unchanged configure does not repaint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PaintKey {
-    size: (u32, u32),
-    scale: i32,
-    spec: WallpaperSpec,
+/// How one output is being drawn.
+///
+/// A still image goes through shm and then sits idle forever. Video needs a GL
+/// surface and a decoder, and is driven by frame callbacks. Keeping them as
+/// separate variants means the cheap case stays cheap: an image wallpaper never
+/// allocates a GL surface.
+enum Backend {
+    Idle,
+    /// Painted at this size and scale; an unchanged configure does not repaint.
+    Image {
+        painted: Option<(u32, u32, i32)>,
+    },
+    Video {
+        surface: GlSurface,
+        player: VideoPlayer,
+        /// Set while a frame callback is outstanding, so one is never requested
+        /// twice for the same surface.
+        awaiting_frame: bool,
+    },
+    Shader {
+        surface: GlSurface,
+        player: ShaderPlayer,
+        awaiting_frame: bool,
+    },
+    Scene {
+        surface: GlSurface,
+        player: ScenePlayer,
+        awaiting_frame: bool,
+    },
 }
 
 struct OutputLayer {
@@ -78,7 +112,9 @@ struct OutputLayer {
     logical: (u32, u32),
     /// Output scale factor; the buffer is this many times larger.
     scale: i32,
-    painted: Option<PaintKey>,
+    /// What the backend was built for. A change here tears it down and rebuilds.
+    current: Option<WallpaperSpec>,
+    backend: Backend,
 }
 
 pub struct Wallpapers {
@@ -97,11 +133,26 @@ pub struct Wallpapers {
     cache: Option<(PathBuf, RgbaImage)>,
     background: [u8; 4],
     layers: Vec<OutputLayer>,
+    /// Created the first time a video is shown, then kept. Sessions that only
+    /// ever use images never build a GL context at all.
+    gl: Option<Renderer>,
+    /// Handed to mpv, which keeps the pointer, so it must outlive every player.
+    resolver: Option<Box<ProcResolver>>,
+    /// Loaded on first video use, then shared across players. Sessions that
+    /// never show a video never load libmpv at all.
+    mpv: Option<Arc<Mpv>>,
+    connection: Connection,
+    qh: QueueHandle<Self>,
     exit: bool,
+    paused: bool,
 }
 
 impl Wallpapers {
-    pub fn new(globals: &GlobalList, qh: &QueueHandle<Self>) -> Result<Self> {
+    pub fn new(
+        connection: &Connection,
+        globals: &GlobalList,
+        qh: &QueueHandle<Self>,
+    ) -> Result<Self> {
         let shm = Shm::bind(globals, qh).context("compositor does not support wl_shm")?;
         let pool = SlotPool::new(1, &shm).context("creating shm pool")?;
         Ok(Wallpapers {
@@ -118,7 +169,13 @@ impl Wallpapers {
             cache: None,
             background: [0, 0, 0, 255],
             layers: Vec::new(),
+            gl: None,
+            resolver: None,
+            mpv: None,
+            connection: connection.clone(),
+            qh: qh.clone(),
             exit: false,
+            paused: false,
         })
     }
 
@@ -209,6 +266,70 @@ impl Wallpapers {
         self.exit = true;
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Suspend wallpaper rendering. Video decoders and shader animations stop
+    /// and frame callbacks cease, dropping CPU and GPU usage to zero.
+    pub fn pause(&mut self) {
+        if self.paused {
+            return;
+        }
+        self.paused = true;
+        for layer in &mut self.layers {
+            match &mut layer.backend {
+                Backend::Video { player, .. } => player.set_paused(true),
+                Backend::Shader { player, .. } => player.set_paused(true),
+                Backend::Scene { player, .. } => player.set_paused(true),
+                _ => {}
+            }
+        }
+    }
+
+    /// Resume wallpaper rendering.
+    pub fn resume(&mut self) {
+        if !self.paused {
+            return;
+        }
+        self.paused = false;
+        for i in 0..self.layers.len() {
+            match &mut self.layers[i].backend {
+                Backend::Video {
+                    player,
+                    awaiting_frame,
+                    ..
+                } => {
+                    player.set_paused(false);
+                    if !*awaiting_frame {
+                        let _ = self.render_video(i);
+                    }
+                }
+                Backend::Shader {
+                    player,
+                    awaiting_frame,
+                    ..
+                } => {
+                    player.set_paused(false);
+                    if !*awaiting_frame {
+                        let _ = self.render_shader(i);
+                    }
+                }
+                Backend::Scene {
+                    player,
+                    awaiting_frame,
+                    ..
+                } => {
+                    player.set_paused(false);
+                    if !*awaiting_frame {
+                        let _ = self.render_scene(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Show one image on every output, driving an event loop until interrupted.
     pub fn run_standalone(path: &Path, scaling: Scaling) -> Result<()> {
         // Decode once up front so an unreadable file fails immediately rather
@@ -220,12 +341,13 @@ impl Wallpapers {
         let (globals, mut queue) = registry_queue_init(&conn).context("initialising registry")?;
         let qh: QueueHandle<Self> = queue.handle();
 
-        let mut state = Wallpapers::new(&globals, &qh)?;
+        let mut state = Wallpapers::new(&conn, &globals, &qh)?;
         state.set(
             Target::All,
             WallpaperSpec {
                 path: path.to_path_buf(),
                 scaling,
+                kind: Kind::Image,
             },
         );
 
@@ -273,7 +395,8 @@ impl Wallpapers {
             layer,
             logical: (0, 0),
             scale,
-            painted: None,
+            current: None,
+            backend: Backend::Idle,
         });
     }
 
@@ -292,6 +415,7 @@ impl Wallpapers {
         Ok(())
     }
 
+    /// Bring one output up to date with its desired wallpaper.
     fn draw(&mut self, index: usize) -> Result<()> {
         let (logical, scale, name) = {
             let l = &self.layers[index];
@@ -305,21 +429,76 @@ impl Wallpapers {
             return Ok(());
         };
 
-        let key = PaintKey {
-            size: (lw, lh),
-            scale,
-            spec: spec.clone(),
-        };
-        if self.layers[index].painted.as_ref() == Some(&key) {
-            return Ok(());
+        // A different wallpaper means a different backend. Tearing down first
+        // keeps the two paths from ever holding resources at once.
+        if self.layers[index].current.as_ref() != Some(&spec) {
+            self.teardown(index);
+            self.layers[index].current = Some(spec.clone());
         }
 
-        // Allocate in device pixels and tell the compositor the scale, so a
-        // HiDPI output gets a sharp wallpaper instead of an upscaled one.
         let width = lw * scale as u32;
         let height = lh * scale as u32;
-        let stride = width as i32 * 4;
 
+        match spec.kind {
+            Kind::Video => self.draw_video(index, &spec, width, height, scale),
+            Kind::Shader => self.draw_shader(index, &spec, width, height, scale),
+            Kind::Scene => self.draw_scene(index, &spec, width, height, scale),
+            _ => self.draw_image(index, &spec, width, height, scale),
+        }
+    }
+
+    /// Release whatever the backend held. Called before switching wallpapers and
+    /// when an output goes away.
+    fn teardown(&mut self, index: usize) {
+        let backend = std::mem::replace(&mut self.layers[index].backend, Backend::Idle);
+        match backend {
+            Backend::Video {
+                surface, player, ..
+            } => {
+                if let Some(gl) = &self.gl {
+                    let _ = gl.make_current(&surface);
+                }
+                // The player must go before the surface it renders into.
+                drop(player);
+                if let Some(gl) = &self.gl {
+                    gl.destroy_surface(surface);
+                }
+            }
+            Backend::Shader {
+                surface, player, ..
+            } => {
+                if let Some(gl) = &self.gl {
+                    player.destroy(&gl.gl);
+                    gl.destroy_surface(surface);
+                }
+            }
+            Backend::Scene {
+                surface, player, ..
+            } => {
+                if let Some(gl) = &self.gl {
+                    player.destroy(&gl.gl);
+                    gl.destroy_surface(surface);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_image(
+        &mut self,
+        index: usize,
+        spec: &WallpaperSpec,
+        width: u32,
+        height: u32,
+        scale: i32,
+    ) -> Result<()> {
+        if let Backend::Image { painted: Some(key) } = &self.layers[index].backend {
+            if *key == (width, height, scale) {
+                return Ok(());
+            }
+        }
+
+        let stride = width as i32 * 4;
         self.load(&spec.path)?;
 
         // Destructured so the pool and the cached image are borrowed as disjoint
@@ -350,10 +529,243 @@ impl Wallpapers {
         surface.damage_buffer(0, 0, width as i32, height as i32);
         buffer.attach_to(surface).context("attaching buffer")?;
         surface.commit();
-        l.painted = Some(key);
+        l.backend = Backend::Image {
+            painted: Some((width, height, scale)),
+        };
 
         // The compositor now owns a copy; ours is recoverable from disk.
         self.cache = None;
+        Ok(())
+    }
+
+    /// Ensure the GL context is initialized, creating it on first use.
+    fn ensure_gl(&mut self) -> Result<()> {
+        if self.gl.is_some() {
+            return Ok(());
+        }
+        let ptr = self.connection.backend().display_ptr() as *mut std::ffi::c_void;
+        // Safe: the connection is owned by this struct and outlives the renderer.
+        let renderer = unsafe { Renderer::new(ptr) }?;
+        renderer.set_nonblocking_present();
+        self.resolver = Some(Box::new(renderer.resolver()));
+        self.gl = Some(renderer);
+        Ok(())
+    }
+
+    /// Ensure libmpv is dynamically loaded for video playback.
+    fn ensure_mpv(&mut self) -> Result<()> {
+        self.ensure_gl()?;
+        if self.mpv.is_none() {
+            self.mpv = Some(Arc::new(Mpv::load()?));
+        }
+        Ok(())
+    }
+
+    fn draw_video(
+        &mut self,
+        index: usize,
+        spec: &WallpaperSpec,
+        width: u32,
+        height: u32,
+        scale: i32,
+    ) -> Result<()> {
+        self.ensure_mpv()?;
+
+        if let Backend::Video { surface, .. } = &mut self.layers[index].backend {
+            surface.resize(width as i32, height as i32);
+        } else {
+            let gl = self.gl.as_ref().expect("created above");
+            let wl_surface = self.layers[index].layer.wl_surface().clone();
+            wl_surface.set_buffer_scale(scale);
+
+            let surface = gl.create_surface(&wl_surface, width as i32, height as i32)?;
+            gl.make_current(&surface)?;
+
+            let resolver = self.resolver.as_ref().expect("created above");
+            let mpv = Arc::clone(self.mpv.as_ref().expect("created above"));
+            let player = VideoPlayer::new(&spec.path, spec.scaling, resolver, mpv)
+                .with_context(|| format!("playing {}", spec.path.display()))?;
+            if self.paused {
+                player.set_paused(true);
+            }
+
+            self.layers[index].backend = Backend::Video {
+                surface,
+                player,
+                awaiting_frame: false,
+            };
+        }
+
+        self.render_video(index)
+    }
+
+    fn draw_shader(
+        &mut self,
+        index: usize,
+        spec: &WallpaperSpec,
+        width: u32,
+        height: u32,
+        scale: i32,
+    ) -> Result<()> {
+        self.ensure_gl()?;
+
+        if let Backend::Shader { surface, .. } = &mut self.layers[index].backend {
+            surface.resize(width as i32, height as i32);
+        } else {
+            let gl = self.gl.as_ref().expect("created above");
+            let wl_surface = self.layers[index].layer.wl_surface().clone();
+            wl_surface.set_buffer_scale(scale);
+
+            let surface = gl.create_surface(&wl_surface, width as i32, height as i32)?;
+            gl.make_current(&surface)?;
+
+            let mut player = ShaderPlayer::new(&spec.path, &gl.gl)
+                .with_context(|| format!("loading shader {}", spec.path.display()))?;
+            if self.paused {
+                player.set_paused(true);
+            }
+
+            self.layers[index].backend = Backend::Shader {
+                surface,
+                player,
+                awaiting_frame: false,
+            };
+        }
+
+        self.render_shader(index)
+    }
+
+    /// Draw one shader frame and request a frame callback for the next.
+    fn render_shader(&mut self, index: usize) -> Result<()> {
+        let Some(gl) = &self.gl else { return Ok(()) };
+        let qh = self.qh.clone();
+
+        let Backend::Shader {
+            surface,
+            player,
+            awaiting_frame,
+        } = &mut self.layers[index].backend
+        else {
+            return Ok(());
+        };
+
+        let (w, h) = surface.size();
+        gl.make_current(surface)?;
+        player.render(&gl.gl, w, h)?;
+        gl.swap_buffers(surface)?;
+
+        if !self.paused && !*awaiting_frame {
+            let wl_surface = self.layers[index].layer.wl_surface();
+            wl_surface.frame(&qh, FrameCallbackData(wl_surface.clone()));
+            wl_surface.commit();
+            if let Backend::Shader { awaiting_frame, .. } = &mut self.layers[index].backend {
+                *awaiting_frame = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_scene(
+        &mut self,
+        index: usize,
+        spec: &WallpaperSpec,
+        width: u32,
+        height: u32,
+        scale: i32,
+    ) -> Result<()> {
+        self.ensure_gl()?;
+
+        if let Backend::Scene { surface, .. } = &mut self.layers[index].backend {
+            surface.resize(width as i32, height as i32);
+        } else {
+            let gl = self.gl.as_ref().expect("created above");
+            let wl_surface = self.layers[index].layer.wl_surface().clone();
+            wl_surface.set_buffer_scale(scale);
+
+            let surface = gl.create_surface(&wl_surface, width as i32, height as i32)?;
+            gl.make_current(&surface)?;
+
+            let mut player = ScenePlayer::new(&spec.path, &gl.gl)
+                .with_context(|| format!("loading scene {}", spec.path.display()))?;
+            if self.paused {
+                player.set_paused(true);
+            }
+
+            self.layers[index].backend = Backend::Scene {
+                surface,
+                player,
+                awaiting_frame: false,
+            };
+        }
+
+        self.render_scene(index)
+    }
+
+    /// Draw one scene frame and request a frame callback for the next.
+    fn render_scene(&mut self, index: usize) -> Result<()> {
+        let Some(gl) = &self.gl else { return Ok(()) };
+        let qh = self.qh.clone();
+
+        let Backend::Scene {
+            surface,
+            player,
+            awaiting_frame,
+        } = &mut self.layers[index].backend
+        else {
+            return Ok(());
+        };
+
+        let (w, h) = surface.size();
+        gl.make_current(surface)?;
+        player.render(&gl.gl, w, h)?;
+        gl.swap_buffers(surface)?;
+
+        if !self.paused && !*awaiting_frame {
+            let wl_surface = self.layers[index].layer.wl_surface();
+            wl_surface.frame(&qh, FrameCallbackData(wl_surface.clone()));
+            wl_surface.commit();
+            if let Backend::Scene { awaiting_frame, .. } = &mut self.layers[index].backend {
+                *awaiting_frame = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Draw one video frame and ask the compositor to tell us when to draw the
+    /// next.
+    ///
+    /// Frame callbacks are what makes this cheap: a compositor stops sending
+    /// them for a surface nobody can see, so an occluded video stops decoding
+    /// without hyprwpe having to detect anything.
+    fn render_video(&mut self, index: usize) -> Result<()> {
+        let Some(gl) = &self.gl else { return Ok(()) };
+        let qh = self.qh.clone();
+
+        let Backend::Video {
+            surface,
+            player,
+            awaiting_frame,
+        } = &mut self.layers[index].backend
+        else {
+            return Ok(());
+        };
+
+        player.pump_events();
+
+        let (w, h) = surface.size();
+        gl.make_current(surface)?;
+        player.render(0, w, h)?;
+        gl.swap_buffers(surface)?;
+        player.report_swap();
+
+        if !self.paused && !*awaiting_frame {
+            let wl_surface = self.layers[index].layer.wl_surface();
+            wl_surface.frame(&qh, FrameCallbackData(wl_surface.clone()));
+            wl_surface.commit();
+            if let Backend::Video { awaiting_frame, .. } = &mut self.layers[index].backend {
+                *awaiting_frame = true;
+            }
+        }
         Ok(())
     }
 }
@@ -362,6 +774,7 @@ fn assignment(spec: &WallpaperSpec) -> Assignment {
     Assignment {
         path: spec.path.clone(),
         scaling: spec.scaling.as_str().to_string(),
+        kind: Some(spec.kind.as_str().to_string()),
     }
 }
 
@@ -371,7 +784,23 @@ fn spec_from(a: &Assignment) -> Option<WallpaperSpec> {
     Some(WallpaperSpec {
         path: a.path.clone(),
         scaling: Scaling::parse(&a.scaling)?,
+        kind: a
+            .kind
+            .as_deref()
+            .and_then(kind_from_str)
+            .unwrap_or(Kind::Image),
     })
+}
+
+fn kind_from_str(s: &str) -> Option<Kind> {
+    match s {
+        "image" => Some(Kind::Image),
+        "video" => Some(Kind::Video),
+        "shader" => Some(Kind::Shader),
+        "scene" => Some(Kind::Scene),
+        "web" => Some(Kind::Web),
+        _ => None,
+    }
 }
 
 /// Fill `canvas` with the scaled image. `canvas` is ARGB8888, which is BGRA in
@@ -461,8 +890,55 @@ impl CompositorHandler for Wallpapers {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        // Nothing animates; no frame callbacks are requested.
+    /// The compositor is ready for another frame.
+    ///
+    /// Animated wallpapers (video, shaders) ask for these. A compositor stops
+    /// sending them for a surface nobody can see, so an occluded animation stops
+    /// drawing on its own — the cheapest possible form of suspend, with zero overhead.
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        let Some(index) = self
+            .layers
+            .iter()
+            .position(|l| l.layer.wl_surface() == surface)
+        else {
+            return;
+        };
+
+        let is_video = matches!(&self.layers[index].backend, Backend::Video { .. });
+        let is_shader = matches!(&self.layers[index].backend, Backend::Shader { .. });
+        let is_scene = matches!(&self.layers[index].backend, Backend::Scene { .. });
+
+        if let Backend::Video { awaiting_frame, .. } = &mut self.layers[index].backend {
+            *awaiting_frame = false;
+        } else if let Backend::Shader { awaiting_frame, .. } = &mut self.layers[index].backend {
+            *awaiting_frame = false;
+        } else if let Backend::Scene { awaiting_frame, .. } = &mut self.layers[index].backend {
+            *awaiting_frame = false;
+        } else {
+            return;
+        }
+        if self.paused {
+            return;
+        }
+        if is_video {
+            if let Err(e) = self.render_video(index) {
+                eprintln!("hyprwpe: {e:#}");
+            }
+        } else if is_shader {
+            if let Err(e) = self.render_shader(index) {
+                eprintln!("hyprwpe: {e:#}");
+            }
+        } else if is_scene {
+            if let Err(e) = self.render_scene(index) {
+                eprintln!("hyprwpe: {e:#}");
+            }
+        }
     }
 
     fn surface_enter(
@@ -523,13 +999,21 @@ impl OutputHandler for Wallpapers {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        self.layers.retain(|l| l.output != output);
+        if let Some(index) = self.layers.iter().position(|l| l.output == output) {
+            // Release the GL surface and decoder before dropping the layer;
+            // otherwise an unplugged monitor leaks a player that keeps decoding.
+            self.teardown(index);
+            self.layers.remove(index);
+        }
     }
 }
 
 impl LayerShellHandler for Wallpapers {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
-        self.layers.retain(|l| &l.layer != layer);
+        if let Some(index) = self.layers.iter().position(|l| &l.layer == layer) {
+            self.teardown(index);
+            self.layers.remove(index);
+        }
     }
 
     fn configure(

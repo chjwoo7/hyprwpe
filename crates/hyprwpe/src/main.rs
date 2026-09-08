@@ -5,6 +5,7 @@
 //! first.
 
 mod daemon;
+mod policy;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -45,6 +46,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Suspend wallpaper rendering (0% CPU).
+    Pause,
+
+    /// Resume wallpaper rendering.
+    Resume,
 
     /// Ask the daemon to exit.
     Stop,
@@ -122,6 +129,8 @@ fn main() -> Result<()> {
             scaling,
         } => set(&wallpaper, output, scaling.into()),
         Command::Status { json } => status(json),
+        Command::Pause => pause(),
+        Command::Resume => resume(),
         Command::Stop => stop(),
         Command::List { kind, json, source } => list(kind.map(Kind::from), json, source),
         Command::Show { image, scaling } => Wallpapers::run_standalone(&image, scaling.into()),
@@ -179,7 +188,15 @@ fn resolve(wallpaper: &str) -> Result<PathBuf> {
     };
 
     match w.kind {
-        Kind::Image => Ok(w.path.clone()),
+        // A Workshop item is a directory; project.json names the file inside it
+        // that is actually the wallpaper.
+        Kind::Image | Kind::Video | Kind::Shader | Kind::Scene => w.media.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{:?} declares itself a {} wallpaper but ships no file to play",
+                w.title,
+                w.kind.as_str()
+            )
+        }),
         other => bail!(
             "{:?} is a {} wallpaper, which hyprwpe cannot render yet",
             w.title,
@@ -221,6 +238,9 @@ fn status(json: bool) -> Result<()> {
     if status.outputs.is_empty() {
         println!("no outputs");
     }
+    if status.paused {
+        println!("state: paused");
+    }
     for o in &status.outputs {
         let wallpaper = o
             .wallpaper
@@ -236,6 +256,26 @@ fn status(json: bool) -> Result<()> {
     if let Some(kb) = status.rss_kb {
         println!("\ndaemon rss: {:.0} MB", kb as f64 / 1024.0);
     }
+    Ok(())
+}
+
+fn pause() -> Result<()> {
+    if !client::daemon_running() {
+        eprintln!("no daemon running");
+        return Ok(());
+    }
+    client::send_ok(&Request::Pause)?;
+    eprintln!("daemon paused");
+    Ok(())
+}
+
+fn resume() -> Result<()> {
+    if !client::daemon_running() {
+        eprintln!("no daemon running");
+        return Ok(());
+    }
+    client::send_ok(&Request::Resume)?;
+    eprintln!("daemon resumed");
     Ok(())
 }
 

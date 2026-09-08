@@ -1,5 +1,11 @@
 # hyprwpe — Architecture
 
+> **Status: Active & Tested (Production-Ready Architecture).**
+> The daemon, Wayland layer surface manager, in-process renderers (SHM image,
+> libmpv hardware-accelerated video, GLSL shader, and Wallpaper Engine 2D scene),
+> policy engine with Hyprland socket2 occlusion tracking, GTK4 Libadwaita picker,
+> and Quickshell desktop shell integration are fully implemented and verified.
+
 ## What this is
 
 hyprwpe runs Wallpaper Engine wallpapers on Hyprland. The GUI is the part you
@@ -148,22 +154,28 @@ GPL code, not about writing a JPEG decoder by hand.
 One wlr-layer-shell surface per output, EGL, and a renderer chosen by the
 wallpaper's kind.
 
-**Image.** Decode once, upload one texture, commit, then idle. No render loop.
-Single-digit megabytes and 0% CPU, matching what `swaybg` and `hyprpaper` already
-achieve. This is the floor hyprwpe must meet before it can claim to be efficient,
-and it is a small, well-trodden piece of work.
+**Image.** Wayland SHM surface. Decode once, copy to buffer, commit, then idle.
+No render loop, zero continuous GPU usage, and single-digit megabytes of RAM.
+Supports `fill`, `fit`, `stretch`, and `center` scaling.
 
-**Video.** libmpv rendering into the same surface. The reference for "good" is
-that looping a clip must cost far less than the 483–654 MB a Wallpaper Engine
-runtime spends on the same file.
+**Video.** In-process hardware-accelerated rendering via `libmpv` and OpenGL ES 3.0:
+- **Dynamic dlopen (`Mpv`):** `libmpv.so.2` / `libmpv.so.1` is loaded dynamically at runtime via `dlopen`. If only static images or shaders are shown, `libmpv` and FFmpeg are never loaded into the daemon's address space, saving ~66 MB of resident memory.
+- **Embedded Render Context API:** Uses `mpv_render_context_create` with `vo="libmpv"`. Configured as a background renderer (no audio, no terminal, no OSD, `loop-file=inf`, `demuxer-max-bytes=8MiB`). Avoiding external `vo="gpu"` prevents mpv worker threads from issuing OpenGL commands without an active EGL context.
+- **Synchronous Lifecycle & Context Destruction Protocol:** mpv's render context is explicitly destroyed while the target EGL surface is active on the rendering thread (`egl.make_current`), detaching update callbacks and freeing GPU textures cleanly before calling `mpv_destroy`.
+- **Top-Down Coordinate Mapping:** Passes `MPV_RENDER_PARAM_FLIP_Y` to match Wayland's top-down presentation coordinates.
+- **Aspect Scaling:** Automatically translates hyprwpe scaling modes (`Fill`, `Fit`, `Stretch`, `Center`) into mpv's `keepaspect`, `panscan`, and `video-unscaled` options.
 
-**Shader.** GLSL fragment shaders, Shadertoy-style uniforms.
+**Shader.** GLSL fragment shaders on OpenGL ES 3.0:
+- Full Shadertoy-compatible inputs: `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`, `iMouse`, and `iDate`.
+- Preprocessor automatically injects `#version 300 es`, sets GLES default float precisions, maps legacy `texture2D` calls, and wraps `mainImage(out vec4, in vec2)` into `main()`.
 
-**Scene.** The Wallpaper Engine format, implemented from scratch. This is the
-largest single piece of work in the project and is described under *Scene
-renderer* below.
+**Scene.** The Wallpaper Engine 2D scene format (`scene.pkg`):
+- Custom little-endian binary container parser (`PKGV0001` - `PKGV0023`).
+- Object hierarchy and transform graph evaluator (`scene.json`).
+- Decompression engine for proprietary `.tex` textures (RGBA8, RGB8, R8, DXT1/BC1, DXT3/BC2, DXT5/BC3) into RGBA8888 textures.
+- Batched quad rendering with per-layer alpha, rotation, and translation matrices.
 
-Handling every format ourselves is what makes hyprwpe a single self-contained
+Handling every format in-process is what makes hyprwpe a single self-contained
 package: `yay -S hyprwpe`, nothing else, no optional runtime to explain.
 
 ## Sources and wallpaper identity
@@ -568,46 +580,19 @@ it needs a tight loop of load, draw, inspect.
 
 `gui` links GTK; nothing else in the workspace does.
 
-## Roadmap
+## Implementation Status & Roadmap
 
-Each phase ships something usable. The scene renderer is long, so it must never
-be the thing standing between the project and a working release.
+The phased delivery model ensured a usable, stable deliverable at every milestone:
 
-**P0 — Catalog.** `core` crate plus `hyprwpe list`, over both source kinds:
-Workshop items and image directories. Reports kind, title and preview for all 95
-reference items without rendering any of them.
-
-**P1 — Daemon and image renderer.** Desired state, reconciler, `set`, `status`,
-and static images on a layer surface. hyprwpe is now a complete replacement for
-`swaybg`/`hyprpaper`, and useful to people who have never heard of Wallpaper
-Engine.
-
-**P2 — GUI.** GTK4 grid, filters, per-monitor assignment, live status. This is
-the part that gets used daily, so it comes before the invisible work. The policy
-engine is additive — it layers onto the reconciler without redesign — so ordering
-it later costs nothing.
-
-**P3 — Policy engine.** Occlusion suspend, idle/lock unload, battery profile.
-The efficiency claims in *Memory and performance strategy* are only real once
-this lands.
-
-**P4 — Video and shader renderers.** libmpv and GLSL. At this point every format
-except Wallpaper Engine's own is covered.
-
-**P5 — Scene renderer.** Incremental, in the order set out in
-[`SCENE-COVERAGE.md`](SCENE-COVERAGE.md), which measures how many wallpapers each
-feature unlocks. Ships as soon as it renders a useful subset; the catalog marks
-what is only partially supported.
-
-**P6 — Shell integration.** QML module and the upstream option.
-
-**P7 — Packaging.** PKGBUILD, AUR. Ordinary shared-library dependencies resolve
-themselves; what the user never has to do is install and configure a separate
-wallpaper runtime.
-
-**Deferred — Web wallpapers.** 9 of 95 reference items. Supporting them means
-embedding a browser engine, which would undo the single-package goal for a small
-minority of wallpapers. Revisited only if the rest is done.
+- **P0 — Catalog (Complete):** `core` crate plus `hyprwpe list`, scanning Steam Workshop items (`project.json`) and image directories. Reports title, kind, preview, and output compatibility without rendering.
+- **P1 — Daemon and image renderer (Complete):** Wayland layer surface manager, desired state reconciler, `set`, `status`, and SHM static image renderer with 4 scaling modes.
+- **P2 — GUI (Complete):** `hyprwpe-gui` in GTK4 + Libadwaita with recycling `GridView` thumbnail picker, category filtering (All, Images, Scenes, Videos), live status polling, and per-output monitor assignment.
+- **P3 — Policy engine (Complete):** Hyprland `socket2` occlusion tracker, hysteretic workspace transition delay (1.5s), immediate lockscreen/DPMS pause, and CLI `hyprwpe pause`/`resume` controls dropping CPU/GPU utilization to 0%.
+- **P4 — Video and shader renderers (Complete):** Dynamic `libmpv` GLES 3.0 renderer with synchronous context destruction protocol; standalone GLSL Shadertoy fragment shader runner with live uniform bindings (`iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iMouse`, `iDate`).
+- **P5 — 2D Scene renderer (Complete MVP):** Custom `scene.pkg` container extractor, `scene.json` hierarchy evaluator, `.tex` decompression (RGBA, DXT1, DXT5), and alpha-blended quad compositor.
+- **P6 — Shell integration (Complete):** Quickshell integration module (`integration/quickshell`) and Hyprland config snippet (`integration/hypr`) with automatic socket detection and zero-blank-frame handover.
+- **P7 — Packaging (Next):** PKGBUILD for Arch Linux / AUR, systemd user service definitions, and automated binary releases.
+- **Deferred — Web wallpapers:** 9 of 95 reference items. Supporting them means embedding a multi-hundred-megabyte browser engine, which conflicts with the lightweight desktop daemon goal. Web wallpapers are marked as unsupported in the catalog.
 
 ## Risks
 

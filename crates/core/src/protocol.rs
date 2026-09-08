@@ -47,6 +47,12 @@ pub enum Request {
     },
     /// Per-output state and resource use.
     Status,
+    /// Suspend all renderers. Frame callbacks stop, video decoders stop,
+    /// and CPU drops to zero. The surfaces stay mapped so the compositor
+    /// shows the last frame rather than nothing.
+    Pause,
+    /// Resume suspended renderers.
+    Resume,
     /// Ask the daemon to exit. Used by `hyprwpe stop`, and to check liveness
     /// without side effects when paired with `Ping`.
     Stop,
@@ -69,6 +75,10 @@ pub enum Response {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
     pub outputs: Vec<OutputStatus>,
+    /// Whether all renderers are paused (either by `hyprwpe pause` or by
+    /// automatic occlusion detection).
+    #[serde(default)]
+    pub paused: bool,
     /// Resident set size in kilobytes, as the daemon sees itself. Efficiency
     /// claims should be checkable without an external profiler.
     pub rss_kb: Option<u64>,
@@ -129,6 +139,8 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
         assert!(matches!(roundtrip(&Request::Status), Request::Status));
+        assert!(matches!(roundtrip(&Request::Pause), Request::Pause));
+        assert!(matches!(roundtrip(&Request::Resume), Request::Resume));
         assert!(matches!(roundtrip(&Request::Ping), Request::Ping));
     }
 

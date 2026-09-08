@@ -133,6 +133,11 @@ pub struct State {
 pub struct Assignment {
     pub path: PathBuf,
     pub scaling: String,
+    /// Which renderer to use. Optional so a state file written before this
+    /// existed still loads; missing means image, which is what those files
+    /// could only have held.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 impl State {
@@ -243,6 +248,7 @@ mod tests {
             default: Some(Assignment {
                 path: PathBuf::from("/tmp/a.png"),
                 scaling: "fill".into(),
+                kind: Some("image".into()),
             }),
             outputs: BTreeMap::new(),
         };
@@ -251,6 +257,7 @@ mod tests {
             Assignment {
                 path: PathBuf::from("/tmp/b.png"),
                 scaling: "fit".into(),
+                kind: Some("image".into()),
             },
         );
         let json = serde_json::to_string(&state).unwrap();
@@ -265,6 +272,7 @@ mod tests {
             default: Some(Assignment {
                 path: PathBuf::from("/definitely/not/here.png"),
                 scaling: "fill".into(),
+                kind: None,
             }),
             outputs: BTreeMap::new(),
         };
@@ -273,6 +281,7 @@ mod tests {
             Assignment {
                 path: PathBuf::from("/also/gone.png"),
                 scaling: "fill".into(),
+                kind: None,
             },
         );
         state.prune_missing();

@@ -3,41 +3,83 @@
 Wallpaper Engine wallpapers on Hyprland — and ordinary wallpapers too, in the
 same place.
 
-> **Status: design stage.** Nothing is implemented yet. The architecture is
-> written up in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the code starts
-> after it settles. Do not expect a working build from this repository yet.
+> **Status: Active & Tested.** The daemon, Wayland layer surface manager, hardware-accelerated video renderer (`libmpv`),
+> GLSL fragment shader renderer (Shadertoy), Wallpaper Engine 2D scene renderer (`scene.pkg`),
+> GTK4 Libadwaita picker (`hyprwpe-gui`), and Quickshell desktop shell integration are fully working and verified.
+> See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the architecture and design.
 
 ## What it is
 
 Most Linux wallpaper tools are *setters*: hand one an image, it puts it up, it
 stops thinking. That model breaks down for Wallpaper Engine wallpapers, which are
-renderers that run forever — holding hundreds of megabytes and burning several
-percent of a core, whether or not anyone can see them.
+renderers that run continuously — holding hundreds of megabytes and burning CPU/GPU cycles,
+even when covered by windows or during lockscreen.
 
-hyprwpe treats the background as a managed resource instead. One daemon owns the
-layer surfaces, knows which outputs are actually visible, and stops paying for
-wallpapers nobody is looking at.
+hyprwpe treats the desktop background as a managed resource instead:
+- **One daemon** owns the Wayland `background` layer surfaces across all outputs.
+- **In-process renderers:** No child processes spawned or killed on wallpaper changes; transitions are atomic function calls.
+- **Zero-overhead suspension:** Hyprland workspace and occlusion events automatically pause render loops when fully covered, locked, or during DPMS off (0% CPU/GPU).
+- **Independent multi-monitor:** Each display output (`eDP-1`, `DP-2`, etc.) can render completely different wallpaper types (e.g., a video on one monitor, a GLSL shader on another).
 
-## Goals
+## Supported Formats
 
-- **Light.** Suspend the wallpaper when every output is covered; unload it while
-  the session is locked or idle; fall back to a still image on battery.
-- **One tool for every wallpaper.** Wallpaper Engine scenes, plain images, video
-  files and GLSL shaders share one catalog, one GUI and one config.
-- **One package.** Every renderer is first-party, so there is no separate
-  wallpaper runtime to install and configure.
-- **Fits a rice.** Designed to sit alongside quickshell-based setups (end4,
-  end4-pC, dots-chjwoo) instead of fighting them for the background layer.
+| Format | Renderer Backend | Status | Features & Notes |
+| :--- | :--- | :---: | :--- |
+| **Static Images** (`.png`, `.jpg`, `.webp`) | Wayland SHM | **Complete** | Memory-efficient CPU blit with zero continuous GPU usage. Supports `fill`, `fit`, `stretch`, `center`. |
+| **Videos** (`.mp4`, `.webm`, `.mkv`) | OpenGL ES 3.0 via `libmpv` | **Complete** | Hardware-accelerated playback with seamless looping. `libmpv` is loaded dynamically (`dlopen`) only when video wallpapers are set. |
+| **GLSL Shaders** (`.frag`) | OpenGL ES 3.0 | **Complete** | Shadertoy-compatible inputs: `iResolution`, `iTime`, `iTimeDelta`, `iFrame`, `iFrameRate`, `iDate`. |
+| **2D Scenes** (`scene.pkg`) | OpenGL ES 3.0 | **Supported** | Parses `scene.pkg` containers and `scene.json` trees; extracts and decompresses `.tex` textures (DXT1, DXT5, RGBA); renders 2D transformed quads with alpha blending. |
+| **Web Wallpapers** (`index.html`) | - | *Unsupported* | Listed in catalog with `(unsupported)` flag to prevent dragging an entire multi-hundred-megabyte browser engine into the desktop background. |
 
-## Planned shape
+## Quick Start
 
+### 1. Build
+```bash
+cargo build --release
 ```
-hyprwpe        daemon + CLI    hyprwpe daemon | set | list | status | pause
-hyprwpe-gui    GTK4 front-end
+Binaries produced in `target/release/`:
+* `hyprwpe`: daemon and command-line controller.
+* `hyprwpe-gui`: GTK4 / Libadwaita wallpaper picker.
+
+### 2. Run the Daemon
+Start the daemon in the background or add it to your Hyprland configuration:
+```bash
+# In ~/.config/hypr/hyprland.conf:
+exec-once = hyprwpe daemon
 ```
 
-Written in Rust. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
-design, the measurements behind it, and the roadmap.
+### 3. Set Wallpapers
+```bash
+# Set wallpaper across all monitors (accepts file path, workshop folder, or catalog ID):
+hyprwpe set 3132826255
+hyprwpe set /path/to/video.mp4
+hyprwpe set examples/rainbow.frag
+
+# Set per-monitor independent wallpapers:
+hyprwpe set --output eDP-1 3132826255
+hyprwpe set --output DP-2 examples/rainbow.frag --scaling fill
+
+# List available wallpapers discovered from Steam Workshop & Pictures:
+hyprwpe list
+
+# Check live daemon state, outputs, scaling, and resident memory:
+hyprwpe status
+
+# Pause / resume rendering manually:
+hyprwpe pause
+hyprwpe resume
+
+# Stop daemon:
+hyprwpe stop
+```
+
+### 4. Open the GUI Picker
+Launch `hyprwpe-gui` for a visual grid picker with filterable categories (All, Images, Scenes, Videos) and per-output target selection.
+
+## Integrations
+
+- **Hyprland:** Layer-shell integration on the `background` layer. See [`integration/hypr/README.md`](integration/hypr/README.md).
+- **Quickshell (`end4`, `dots-chjwoo`):** Clean socket-based handover so desktop widgets float above animated wallpapers without layer conflicts. See [`integration/quickshell/README.md`](integration/quickshell/README.md).
 
 ## Wallpaper Engine content
 

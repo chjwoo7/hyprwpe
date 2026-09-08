@@ -310,12 +310,20 @@ fn bind_tile(child: &gtk4::Widget, index: usize, app: &Rc<App>) {
 }
 
 fn apply(wallpaper: &hyprwpe_core::Wallpaper, app: &Rc<App>) -> String {
-    if wallpaper.kind != Kind::Image {
+    if !wallpaper.supported() {
         return format!(
             "hyprwpe cannot render {} wallpapers yet",
             wallpaper.kind.as_str()
         );
     }
+
+    // For a plain file, path is the file. For a Workshop item, `media` is the
+    // actual file to play (named in project.json); path is the directory.
+    let file = wallpaper
+        .media
+        .as_ref()
+        .unwrap_or(&wallpaper.path)
+        .clone();
 
     let sel = app.selection.borrow().clone();
     let target = match &sel.output {
@@ -323,7 +331,7 @@ fn apply(wallpaper: &hyprwpe_core::Wallpaper, app: &Rc<App>) -> String {
         None => Target::All,
     };
     let request = Request::Set {
-        path: wallpaper.path.clone(),
+        path: file,
         target,
         scaling: sel.scaling.clone(),
     };

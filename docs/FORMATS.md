@@ -159,13 +159,64 @@ appearance keys (`origin`, `scale`, `angles`, `visible`, `parallaxDepth`,
 See [`SCENE-COVERAGE.md`](SCENE-COVERAGE.md) for how often each kind and effect
 appears, which is what drives the renderer's build order.
 
-## `.tex` textures
+## `.tex` textures — confirmed
 
-Not started.
+All integers are little-endian `u32`.
 
-## Shader dialect
+### Container layout
+Can be prefixed with a 4-byte length (`0x08, 0x00, 0x00, 0x00`) or appear bare:
 
-Not started. The transpile chain is intended to be
-`our preprocessor → glslang/shaderc → spirv-cross`, so what is documented here is
-Wallpaper Engine's own conventions — macros, includes, uniform naming — rather
-than HLSL itself.
+```
+[optional u32 len]
+char[8] magic                   "TEXV0001" or "TEXB0001"
+u32    format_id                texture format (RGBA8, DXT1, DXT3, DXT5, etc.)
+u32    width                    image width in pixels
+u32    height                   image height in pixels
+[optional u32 extra]            mipmap / flags
+<blob>                          pixel / block data
+```
+
+| Field | Source | Note |
+| --- | --- | --- |
+| `magic` | `bytes` | `TEXV####` or `TEXB####` |
+| `format_id` | `experiment` | Standard format enumeration matching DXGI / D3D constants |
+| `width`, `height` | `bytes` | Positive dimensions matching layer aspect ratios |
+| `data` | `bytes` | Raw RGBA8 or BC1/BC2/BC3 blocks |
+
+### Format Enumeration
+- `0`, `1`, `28`: RGBA8 (uncompressed 32-bit `width * height * 4` bytes)
+- `2`, `29`: RGB8 (uncompressed 24-bit)
+- `3`, `61`: R8 (single-channel 8-bit)
+- `4`, `10`, `71`: DXT1 / BC1 (8 bytes per 4x4 block, 1-bit alpha)
+- `5`, `11`, `74`: DXT3 / BC2 (16 bytes per 4x4 block, explicit 4-bit alpha)
+- `6`, `12`, `77`: DXT5 / BC3 (16 bytes per 4x4 block, interpolated 8-bit alpha)
+
+All compressed formats are decompressed into 32-bit RGBA8888 for universal OpenGL ES 3.0 compatibility.
+
+## Video Wallpapers — confirmed
+
+Workshop items with `type: video` declare a relative path to a video container in `project.json` (under `"file"`):
+- Containers observed: `.mp4` (H.264 / AVC, AAC audio), `.webm` (VP8 / VP9), `.mkv`.
+- Playback engine: `libmpv` loaded dynamically via `dlopen`.
+- Options configured for wallpaper use:
+  - `vo`: `"libmpv"` (uses embedded OpenGL render context; avoids external VO threads that crash on TLS dispatch tables).
+  - `loop-file`: `"inf"` (seamless hardware looping).
+  - `audio`: `"no"` (silent background rendering).
+  - `cache`: `"no"`, `demuxer-max-bytes`: `"8MiB"`, `demuxer-max-back-bytes`: `"0"` (bounds memory footprint for looping short clips).
+- Aspect ratio and scaling mapping:
+  - `Fill`: `keepaspect=yes`, `panscan=1.0`, `video-unscaled=no`
+  - `Fit`: `keepaspect=yes`, `panscan=0.0`, `video-unscaled=no`
+  - `Stretch`: `keepaspect=no`, `panscan=0.0`, `video-unscaled=no`
+  - `Center`: `keepaspect=yes`, `panscan=0.0`, `video-unscaled=yes`
+
+## Shader dialect — confirmed
+Standalone GLSL fragment shaders (`.glsl`, `.frag`) support standard Shadertoy uniforms:
+`iResolution`, `iTime`, `iTimeDelta`, `iFrameRate`, `iFrame`, `iMouse`, `iDate`, and `#define texture2D texture`.
+The preprocessor auto-injects `#version 300 es`, precision qualifiers, and wraps `mainImage` into `main()`.
+
+## Web Wallpapers — intentionally unsupported
+Workshop items with `type: web` contain an `index.html` file designed to be run in Chromium/CEF.
+- Observed count: 9/95 in reference library.
+- Status: Flagged as `(unsupported)` in the catalog.
+- Rationale: Embedding a full browser engine (Chromium/WebKit) incurs hundreds of megabytes of RAM and massive binary bloat, violating the core lightweight daemon invariant. Users are informed directly in the catalog rather than encountering silent failure.
+
