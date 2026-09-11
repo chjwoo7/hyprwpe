@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod hyprland;
+pub mod mdlv;
 pub mod pkg;
 pub mod protocol;
 pub mod scene;

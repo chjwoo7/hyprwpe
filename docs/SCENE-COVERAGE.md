@@ -127,10 +127,25 @@ rendering the synthetic marker scene at fixed times — (400,400) at t=0,
 (1900,1100) at t=1, (3400,1800) at t=2 — and live, where the centroid advances
 between screenshots.
 
-**1c. Puppet models (MDLV).** 12/75 wallpapers reference a `…_puppet.mdl`, which
-carries a deforming mesh and its own animation — this is what moves a character
-like the Akali phone-version body. Not implemented; such models render as their
-static material texture. This is the next large piece after particles.
+**1c. Puppet models (MDLV).** 12/75 wallpapers reference a `…_puppet.mdl`,
+which replaces the quad with a deforming mesh. The parse is implemented in
+`crates/core/src/mdlv.rs` and is **version driven**: sections are found by their
+`MD??NNNN` tags and each one's end comes from the next-section offset the file
+stores itself, so nothing indexes a specific wallpaper's bytes. It reads the mesh
+(positions, UVs, triangle indices), the skeleton (`MDLS`: bone parents + 4x4 bind
+matrices), attachments (`MDAT`) and animations (`MDLA`: name, mode, fps, length
+and per-bone keyframes of position/rotation/scale).
+
+Verified across the whole corpus with
+`cargo run -p hyprwpe-core --example validate_mdlv -- <dir>`:
+**48/48 files parse with a usable mesh**, spanning all five revisions
+(`MDLV0013` 19, `0014` 3, `0016` 11, `0017` 1, `0023` 14) — e.g. the Akali body
+1061 vertices / 1771 triangles / 33 bones / 12 animations, and the butterfly
+48 / 81 / 1 / 1.
+
+Still to come: the per-vertex **skin weights** (in the vertex record payload
+between position and UV) and the skinning that turns them plus the animation into
+a deformed mesh; until then a puppet renders as its static material texture.
 
 **2. Particles.** 52/75 wallpapers. The largest single jump available.
 
