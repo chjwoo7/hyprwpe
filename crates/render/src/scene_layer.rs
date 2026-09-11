@@ -712,10 +712,11 @@ impl ScenePlayer {
 
     /// A short description of what this scene contains, for tools and logs.
     ///
-    /// `layers / image objects` is the honest resolution figure: the denominator
-    /// counts the image-kind objects the scene actually wants drawn, so objects
-    /// hidden by a property gate are not counted against us. The ratio then says
-    /// how many of them the texture chain resolved into something drawable.
+    /// `resolved / image objects` is the honest ratio: the denominator counts the
+    /// image-kind objects the scene actually wants drawn (objects hidden by a
+    /// property gate are not counted against us), and the numerator counts the
+    /// ones that became something drawable - a textured quad *or* a skinned mesh,
+    /// since a model naming a `puppet` is drawn as triangles rather than a quad.
     pub fn describe(&self) -> String {
         let image_objects = self
             .objects
@@ -724,13 +725,16 @@ impl ScenePlayer {
                 o.kind() == ObjectKind::Image && o.particle_path().is_none() && o.is_visible()
             })
             .count();
+        let quads = self.layers.iter().filter(|l| l.visible).count();
+        let puppets = self.puppets.iter().filter(|p| p.visible).count();
         format!(
-            "{} layers of {} image objects ({} with effects, {} effect passes), {} puppets, {} particle systems, design {:?}, zoom {}, scaling {:?}",
-            self.layers.iter().filter(|l| l.visible).count(),
+            "{} resolved of {} image objects ({} quads, {} puppets; {} with effects, {} effect passes), {} particle systems, design {:?}, zoom {}, scaling {:?}",
+            quads + puppets,
             image_objects,
+            quads,
+            puppets,
             self.layers.iter().filter(|l| !l.effects.is_empty()).count(),
             self.effect_count,
-            self.puppets.len(),
             self.particles.len(),
             self.design,
             self.zoom,
