@@ -179,8 +179,10 @@ fn read_f32s(d: &[u8], o: usize, n: usize) -> Option<Vec<f32>> {
     let bytes = d.get(o..o + n * 4)?;
     Some(
         bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
     )
 }
@@ -317,7 +319,7 @@ fn parse_mesh(d: &[u8]) -> Option<Mesh> {
             continue;
         };
         let vb = vb as usize;
-        if vb == 0 || vb % 4 != 0 || vs + vb + 4 > d.len() {
+        if vb == 0 || !vb.is_multiple_of(4) || vs + vb + 4 > d.len() {
             continue;
         }
         let io = vs + vb;
@@ -352,11 +354,11 @@ fn parse_mesh(d: &[u8]) -> Option<Mesh> {
             let Some(n) = indices.iter().copied().max().map(|m| m as usize + 1) else {
                 continue;
             };
-            if n < 3 || vb % n != 0 {
+            if n < 3 || !vb.is_multiple_of(n) {
                 continue;
             }
             let stride = vb / n;
-            if stride % 4 != 0 || !(MIN_STRIDE..=MAX_STRIDE).contains(&stride) {
+            if !stride.is_multiple_of(4) || !(MIN_STRIDE..=MAX_STRIDE).contains(&stride) {
                 continue;
             }
             let nf = stride / 4;
@@ -516,28 +518,31 @@ fn animations_with_trailer(
             }
             // Tracks are contiguous per frame; the observed correlation is
             // `length + 1` keys, but the size field is authoritative.
-            let nkeys = if length > 0 && size % (length as usize + 1) == 0 {
+            let nkeys = if length > 0 && size.is_multiple_of(length as usize + 1) {
                 length as usize + 1
-            } else if size % KEYFRAME_BYTES == 0 {
+            } else if size.is_multiple_of(KEYFRAME_BYTES) {
                 size / KEYFRAME_BYTES
             } else {
                 0
             };
-            let mut keys = Vec::with_capacity(nkeys);
-            if nkeys > 0 {
-                let stride = size / nkeys;
-                if stride < KEYFRAME_BYTES {
-                    return None;
+            let mut keys = Vec::new();
+            match size.checked_div(nkeys) {
+                // A stride smaller than one keyframe cannot be right.
+                Some(stride) if stride < KEYFRAME_BYTES => return None,
+                Some(stride) => {
+                    keys.reserve(nkeys);
+                    for k in 0..nkeys {
+                        let o = p + k * stride;
+                        let v = read_f32s(d, o, 9)?;
+                        keys.push(Keyframe {
+                            position: [v[0], v[1], v[2]],
+                            rotation: v[5],
+                            scale: [v[6], v[7], v[8]],
+                        });
+                    }
                 }
-                for k in 0..nkeys {
-                    let o = p + k * stride;
-                    let v = read_f32s(d, o, 9)?;
-                    keys.push(Keyframe {
-                        position: [v[0], v[1], v[2]],
-                        rotation: v[5],
-                        scale: [v[6], v[7], v[8]],
-                    });
-                }
+                // `nkeys == 0`: a track that carries no keys.
+                None => {}
             }
             p += size;
             tracks.push(Track { keys });
@@ -591,7 +596,9 @@ pub fn parse(bytes: &[u8]) -> Result<PuppetModel> {
     };
 
     let mesh = parse_mesh(bytes).unwrap_or_default();
-    let bones = find("MDLS").map(|s| parse_skeleton(bytes, &s)).unwrap_or_default();
+    let bones = find("MDLS")
+        .map(|s| parse_skeleton(bytes, &s))
+        .unwrap_or_default();
     let attachments = find("MDAT")
         .map(|s| parse_attachments(bytes, &s))
         .unwrap_or_default();
@@ -647,7 +654,11 @@ mod tests {
     #[test]
     fn section_scan_finds_each_tag_once_in_order() {
         let mut d = vec![0u8; 300];
-        for (off, tag) in [(0usize, b"MDLV0023"), (100, b"MDLS0004"), (200, b"MDLA0006")] {
+        for (off, tag) in [
+            (0usize, b"MDLV0023"),
+            (100, b"MDLS0004"),
+            (200, b"MDLA0006"),
+        ] {
             d[off..off + 8].copy_from_slice(tag);
             d[off + 8] = 0;
             let next = (off + 90) as u32;
@@ -693,7 +704,11 @@ mod tests {
         };
         // t = 0.15s -> frame 1.5 -> halfway between keys 1 and 2.
         let s = anim.sample(0.15);
-        assert!((s[0].position[0] - 15.0).abs() < 1e-3, "{:?}", s[0].position);
+        assert!(
+            (s[0].position[0] - 15.0).abs() < 1e-3,
+            "{:?}",
+            s[0].position
+        );
         // frame 3 == length, loop wraps to 0.
         let s = anim.sample(0.3);
         assert!(s[0].position[0].abs() < 1e-3, "{:?}", s[0].position);

@@ -139,7 +139,7 @@ impl MeshRenderer {
         }
 
         let mut safe = Vec::with_capacity(indices.len());
-        for tri in indices.chunks_exact(3) {
+        for tri in indices.as_chunks::<3>().0 {
             if tri.iter().all(|&i| (i as usize) < n) {
                 safe.extend_from_slice(tri);
             }
@@ -197,7 +197,14 @@ impl MeshRenderer {
         self.index_count == 0
     }
 
-    pub fn draw(&self, gl: &glow::Context, projection: &Mat4, model: &Mat4, texture: glow::Texture, color: [f32; 4]) {
+    pub fn draw(
+        &self,
+        gl: &glow::Context,
+        projection: &Mat4,
+        model: &Mat4,
+        texture: glow::Texture,
+        color: [f32; 4],
+    ) {
         if self.index_count == 0 {
             return;
         }
