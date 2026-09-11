@@ -320,11 +320,21 @@ impl Sim {
             if let Some(r) = trail {
                 // A trail is the sprite repeated along its recent path, fading
                 // toward the tail. `length` scales the history used.
-                let len = (r.f32_or("length", 0.03) * 400.0).clamp(2.0, p.trail.len() as f32);
-                let n = len as usize;
-                let start = p.trail.len().saturating_sub(n);
+                //
+                // The desired length is clamped to the history that *exists*,
+                // and the floor is only applied when there is something to
+                // clamp to: `clamp(2.0, trail.len())` panics while a young
+                // particle has fewer than two samples, which took the whole
+                // renderer down on any scene using a trail renderer.
+                let available = p.trail.len();
+                let wanted = (r.f32_or("length", 0.03) * 400.0).max(0.0);
+                let n = (wanted.max(2.0) as usize).min(available);
+                if n == 0 {
+                    continue;
+                }
+                let start = available.saturating_sub(n);
                 for (k, tpos) in p.trail[start..].iter().enumerate() {
-                    let f = (k + 1) as f32 / n.max(1) as f32;
+                    let f = (k + 1) as f32 / n as f32;
                     out.push(Sprite {
                         pos: *tpos,
                         size: p.size * (0.35 + 0.65 * f),
@@ -748,5 +758,77 @@ mod tests {
         let mut sim = Sim::new(sys, vec![], 1);
         assert!(run(&mut sim, 1.0).is_empty(), "nothing before starttime");
         assert!(!run(&mut sim, 1.5).is_empty(), "particles after starttime");
+    }
+
+    /// Regression: `advance_to` must reach an absolute time in one call, because
+    /// that is how an offline render is placed at a moment. Stepping on the wall
+    /// clock instead made a fixed-time render spawn nothing, so a particle-only
+    /// wallpaper measured as a blank frame.
+    #[test]
+    fn advance_to_reaches_an_absolute_time_in_one_call() {
+        let sys = parse(
+            r#"{"emitter":[{"name":"sphererandom","rate":30,"distancemax":1}],
+                "initializer":[{"name":"lifetimerandom","min":5,"max":5}],
+                "renderer":[{"name":"sprite"}], "starttime": 0}"#,
+        )
+        .unwrap();
+        let mut sim = Sim::new(sys, vec![], 1);
+        // One call, no per-frame stepping by the caller.
+        let sprites = sim.advance_to(6.0);
+        assert!(
+            !sprites.is_empty(),
+            "a system running for 6s must have live sprites"
+        );
+        assert!(sim.live() > 0, "and they must be in the population");
+    }
+
+    /// A system whose `starttime` has not arrived must still be empty when
+    /// `advance_to` jumps there directly, rather than spawning a burst.
+    #[test]
+    fn advance_to_respects_starttime_without_bursting() {
+        let sys = parse(
+            r#"{"emitter":[{"name":"sphererandom","rate":30,"distancemax":1}],
+                "initializer":[{"name":"lifetimerandom","min":5,"max":5}],
+                "renderer":[{"name":"sprite"}], "starttime": 4}"#,
+        )
+        .unwrap();
+        let mut sim = Sim::new(sys, vec![], 1);
+        assert!(sim.advance_to(3.0).is_empty(), "before starttime: nothing");
+        // Past it, the population is what a continuous run would have produced,
+        // not everything at once.
+        let sprites = sim.advance_to(6.0);
+        assert!(!sprites.is_empty(), "after starttime: particles");
+        assert!(
+            sim.live() <= 30 * 5 + 30,
+            "no burst: 6s of simulation, not a spike ({})",
+            sim.live()
+        );
+    }
+
+    /// Regression: a trail renderer panicked while a particle was young. The
+    /// trail length was clamped with `clamp(2.0, trail.len())`, and a particle
+    /// that has existed for one sample has `trail.len()` of 0 or 1 - so
+    /// `min > max` and the clamp panicked, taking the whole renderer (and so the
+    /// daemon) down on any scene using a trail renderer.
+    #[test]
+    fn a_trail_renderer_survives_a_young_particle() {
+        for name in ["spritetrail", "ropetrail"] {
+            let sys = parse(&format!(
+                r#"{{"emitter":[{{"name":"sphererandom","rate":60,"distancemax":1}}],
+                    "initializer":[{{"name":"lifetimerandom","min":5,"max":5}}],
+                    "renderer":[{{"name":"{name}"}}], "starttime": 0}}"#
+            ))
+            .unwrap();
+            let mut sim = Sim::new(sys, vec![], 1);
+            // One frame: the particles exist but their trails are almost empty.
+            let fresh = run(&mut sim, 1.0 / 60.0);
+            assert!(
+                !fresh.is_empty(),
+                "{name}: a fresh particle must still draw"
+            );
+            // And it keeps working once the trails have history.
+            let later = run(&mut sim, 2.0);
+            assert!(!later.is_empty(), "{name}: and once it has a trail");
+        }
     }
 }

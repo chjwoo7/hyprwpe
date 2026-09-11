@@ -1047,7 +1047,14 @@ impl ScenePlayer {
                     // `Instant` deltas meant a headless render at a fixed time
                     // advanced the sim by ~0s and spawned nothing, however long
                     // the scene had "been running".
-                    let dt = (t - p.sim_time).clamp(0.0, 0.1);
+                    //
+                    // Written as a guarded subtraction rather than `clamp`,
+                    // which panics on a NaN and would take the renderer down.
+                    let dt = if t > p.sim_time {
+                        (t - p.sim_time).min(0.1)
+                    } else {
+                        0.0
+                    };
                     p.sim_time = t;
                     p.sprites = p.sim.step(dt);
                     let placement = if self.animated {
