@@ -879,6 +879,25 @@ impl ScenePlayer {
                 gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
+                if debug_fx {
+                    // What the object rendered as, before any effect touches it.
+                    // A chain cannot be blamed for a blank input.
+                    let mut px = [0u8; 4];
+                    gl.read_pixels(
+                        width / 2,
+                        height / 2,
+                        1,
+                        1,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut px)),
+                    );
+                    eprintln!(
+                        "fx: object render center = ({}, {}, {}, {}) alpha={}",
+                        px[0], px[1], px[2], px[3], alpha
+                    );
+                }
+
                 // Each chain reads what the previous one produced, so the effect
                 // stack composes exactly as the engine's does.
                 let extra: Vec<Option<glow::Texture>> = vec![None; 8];
@@ -1113,7 +1132,11 @@ fn build_effect_chains(
             .iter()
             .map(|p| p.constantshadervalues.clone())
             .collect();
-        match crate::effect_pass::Chain::new(gl, res, &body, &values) {
+        // The combos a scene selects are compile-time: they decide which branch
+        // of the shader's `#if` chain is built, so a pass with the wrong branch
+        // does not merely look different, it can render nothing at all.
+        let combos: Vec<Vec<String>> = effect.passes.iter().map(|p| p.defines()).collect();
+        match crate::effect_pass::Chain::with_combos(gl, res, &body, &values, &combos) {
             Ok(chain) if !chain.is_empty() => chains.push(chain),
             Ok(_) => {}
             Err(e) => eprintln!("hyprwpe: effect {file}: {e:#}"),

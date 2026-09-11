@@ -473,6 +473,45 @@ pub struct EffectPass {
     pub id: Option<u32>,
     #[serde(default)]
     pub constantshadervalues: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Compile-time options for this pass, as `NAME -> value`.
+    ///
+    /// These select which branch of the shader's `#if` chain compiles: the same
+    /// `effects/blur` file is a horizontal or a vertical pass depending on
+    /// `VERTICAL`, and `BLENDMODE` picks how a composite pass combines its
+    /// inputs. They are **not** value uniforms - 45 of the corpus' 133 scene
+    /// effect passes carry at least one - and a pass compiled with the wrong
+    /// branch silently produces the wrong image.
+    #[serde(default)]
+    pub combos: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl EffectPass {
+    /// This pass's options as `#define` lines.
+    pub fn defines(&self) -> Vec<String> {
+        combo_defines(self.combos.as_ref())
+    }
+}
+
+/// Render a combo map as `NAME=VALUE` defines.
+///
+/// A JSON `true`/`false` becomes `1`/`0`, which is what the shaders' `#if` tests
+/// expect; a string is passed through, since a combo may select a named mode.
+pub fn combo_defines(combos: Option<&serde_json::Map<String, serde_json::Value>>) -> Vec<String> {
+    let Some(combos) = combos else {
+        return Vec::new();
+    };
+    combos
+        .iter()
+        .map(|(k, v)| {
+            let value = match v {
+                serde_json::Value::Bool(b) => (*b as u8).to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            format!("{k}={value}")
+        })
+        .collect()
 }
 
 /// The inferred kind of a scene object based on which key it contains.

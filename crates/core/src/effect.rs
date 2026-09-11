@@ -392,6 +392,9 @@ pub struct MaterialPass {
     pub cull: bool,
     pub textures: Vec<Option<String>>,
     pub constants: BTreeMap<String, serde_json::Value>,
+    /// Compile-time options the material fixes for this pass, e.g.
+    /// `{"VERTICAL": 1}`. Merged under the scene's own combos, which win.
+    pub combos: BTreeMap<String, serde_json::Value>,
 }
 
 /// Parse a material JSON into its passes.
@@ -416,6 +419,11 @@ pub fn parse_material(json: &str) -> Result<Vec<MaterialPass>> {
             .and_then(|c| c.as_object())
             .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
+        let combos = p
+            .get("combos")
+            .and_then(|c| c.as_object())
+            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
         out.push(MaterialPass {
             shader: get_s("shader").unwrap_or_default(),
             blending: get_s("blending").unwrap_or_else(|| "normal".into()),
@@ -423,6 +431,7 @@ pub fn parse_material(json: &str) -> Result<Vec<MaterialPass>> {
             cull: !matches!(get_s("cullmode").as_deref(), Some("nocull")),
             textures,
             constants,
+            combos,
         });
     }
     Ok(out)

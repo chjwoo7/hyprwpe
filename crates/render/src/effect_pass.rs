@@ -50,18 +50,37 @@ impl Blending {
     }
 }
 
-/// One resolved pass, ready to draw.
+/// One pass of an effect chain, resolved and ready to draw.
+///
+/// An effect's passes form a small render graph: each writes to a **named
+/// buffer** (`target`) and reads specific buffers into specific samplers
+/// (`bind`), where the name `previous` means the chain's input. That graph is
+/// what makes `godrays` work at all - its cast pass writes a ray mask, and its
+/// final `combine` pass reads both the mask *and* the untouched input - so a
+/// chain that ignores `target`/`bind` and simply feeds each pass the last result
+/// produces a blank frame.
 pub struct Pass {
     program: glow::Program,
     /// Uniforms the shader declares, with the material key each reads.
     uniforms: Vec<UniformBinding>,
     /// Uniform locations, resolved once at link time.
     locations: BTreeMap<String, Option<glow::UniformLocation>>,
-    /// Sampler slots: `None` means "the previous pass's result".
-    textures: Vec<Option<String>>,
+    /// The buffer this pass writes to, or `None` for the chain's own output.
+    target: Option<String>,
+    /// Which named buffer feeds each sampler slot.
+    bind: Vec<(String, usize)>,
     blending: Blending,
     /// Kept for diagnostics: which shader this pass came from.
     pub shader: String,
+}
+
+/// A resolved value is converted to GL types at bind time; see `set_uniform`.
+///
+/// One pass of an effect file: the material to run, plus the buffer wiring.
+struct PassSpec {
+    material: String,
+    target: Option<String>,
+    bind: Vec<(String, usize)>,
 }
 
 /// The resolved value of one uniform: a shader that declares `float g_X` wants
@@ -75,8 +94,8 @@ pub fn parse_value_vec(value: &serde_json::Value) -> Option<[f32; 4]> {
         }
         serde_json::Value::Bool(b) => Some([*b as u8 as f32, 0.0, 0.0, 0.0]),
         serde_json::Value::String(s) => {
-            // The engine writes colours as `"1 0.5 0"` and also accepts a
-            // `#rrggbb`, because the editor's colour picker produces hex.
+            // The engine writes colours as `"1 0.5 0"` and the editor's colour
+            // picker also produces hex.
             if let Some(hex) = s.trim().strip_prefix('#') {
                 if hex.len() >= 6 {
                     let f = |i: usize| {
@@ -150,7 +169,7 @@ pub fn resolve_value(
 
 /// A scene value may still be a `{"user": …, "value": …}` binding. The property
 /// layer resolves those before a scene is parsed, so this is a safety net for a
-/// caller that resolved nothing: take the authored value rather than dropping it.
+/// caller that resolved nothing: take the authored value rather than drop it.
 fn unwrap_user(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(o) if o.contains_key("value") => o["value"].clone(),
@@ -158,12 +177,13 @@ fn unwrap_user(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// What a named buffer is for, so allocation is reported honestly.
+const BUFFER_MEMORY_NOTE: &str = "buffers are allocated at the output size, not the reduced size the engine's `_rt_Quarter`/`_rt_Half` names imply: the shaders sample with normalised coordinates, so a full-size buffer is correct and merely costs memory";
+
 /// A render target: a texture plus the framebuffer that draws into it.
 struct Target {
     texture: glow::Texture,
     framebuffer: glow::Framebuffer,
-    width: i32,
-    height: i32,
 }
 
 impl Target {
@@ -185,26 +205,14 @@ impl Target {
         );
         // Clamping matters: an effect that offsets UVs should smear the edge
         // pixel, not wrap around to the opposite side of the wallpaper.
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::LINEAR as i32,
-        );
+        for (name, value) in [
+            (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+            (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+            (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+        ] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
+        }
 
         let framebuffer = gl
             .create_framebuffer()
@@ -221,8 +229,6 @@ impl Target {
         Ok(Target {
             texture,
             framebuffer,
-            width,
-            height,
         })
     }
 
@@ -261,8 +267,8 @@ impl Quad {
             std::mem::size_of_val(&Self::VERTICES),
         );
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-        // The effect vertex shaders declare `a_Position` and `a_TexCoord`, and
-        // those locations are bound at link time to 0 and 1.
+        // The effect vertex shaders declare `a_Position` and `a_TexCoord`, bound
+        // to locations 0 and 1 at link time.
         let stride = 4 * std::mem::size_of::<f32>() as i32;
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
@@ -278,109 +284,131 @@ impl Quad {
     }
 }
 
-/// One object's effect chain, ready to run each frame.
+/// One effect file's chain: the passes plus the buffers they name.
 pub struct Chain {
     passes: Vec<Pass>,
-    targets: Vec<Target>,
+    /// Named intermediate buffers, created on first use at the input's size.
+    buffers: BTreeMap<String, Target>,
+    /// Where the last pass writes when it names no target.
+    output: Option<Target>,
     quad: Quad,
+    size: (i32, i32),
 }
 
 impl Chain {
-    /// Build the chain an effect file describes.
-    ///
-    /// `scene_values` is the object's own `passes[].constantshadervalues` for
-    /// each effect pass, in order and aligned with the effect's own passes. The
-    /// two are separate because a shader pass may be expanded from one effect
-    /// pass, so the alignment is by index into what the material declares.
+    /// Build the chain an effect file describes, without combos.
     pub fn new(
         gl: &glow::Context,
         res: &Resources,
         effect_json: &str,
         scene_values: &[Option<serde_json::Map<String, serde_json::Value>>],
     ) -> Result<Self> {
-        let ev: serde_json::Value =
-            serde_json::from_str(effect_json).context("parsing effect.json")?;
-        let materials: Vec<String> = ev
-            .get("passes")
-            .and_then(|p| p.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| p.get("material").and_then(|m| m.as_str()))
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if materials.is_empty() {
+        Self::with_combos(gl, res, effect_json, scene_values, &[])
+    }
+
+    /// Build the chain, honouring the combos the scene selected.
+    ///
+    /// `combos` is aligned with `scene_values`: entry `i` belongs to the i-th
+    /// pass the material declares. A combo selects which branch of the shader's
+    /// `#if` chain is compiled, so a pass built with the wrong branch can render
+    /// nothing rather than merely looking different.
+    pub fn with_combos(
+        gl: &glow::Context,
+        res: &Resources,
+        effect_json: &str,
+        scene_values: &[Option<serde_json::Map<String, serde_json::Value>>],
+        combos: &[Vec<String>],
+    ) -> Result<Self> {
+        let specs = parse_effect_passes(effect_json)?;
+        if specs.is_empty() {
             anyhow::bail!("effect has no material passes");
         }
 
         unsafe {
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
         }
-
         let quad = unsafe { Quad::new(gl)? };
         let mut passes = Vec::new();
         let mut pass_index = 0usize;
 
-        for material in materials {
-            let Some(body) = res.get_str(&material) else {
+        for spec in specs {
+            let Some(body) = res.get_str(&spec.material) else {
+                eprintln!("hyprwpe: effect material {} is missing", spec.material);
                 continue;
             };
             let material_passes = effect::parse_material(&body)
-                .with_context(|| format!("parsing material {material}"))?;
+                .with_context(|| format!("parsing material {}", spec.material))?;
             for mp in material_passes {
                 if mp.shader.is_empty() {
                     continue;
                 }
                 let scene = scene_values.get(pass_index).and_then(|v| v.as_ref());
-                match Self::build_pass(gl, res, &mp, scene) {
+                let pass_combos = combos.get(pass_index);
+                match Self::build_pass(gl, res, &mp, scene, pass_combos, &spec.target, &spec.bind) {
                     Ok(pass) => passes.push(pass),
-                    Err(e) => {
-                        // A pass that will not build is reported and skipped
-                        // rather than failing the whole object: a wallpaper
-                        // missing one effect is much better than one missing
-                        // everything.
-                        eprintln!("hyprwpe: effect pass {} skipped: {e:#}", mp.shader);
-                    }
+                    Err(e) => eprintln!("hyprwpe: effect pass {} skipped: {e:#}", mp.shader),
                 }
                 pass_index += 1;
             }
         }
+        let _ = BUFFER_MEMORY_NOTE;
 
         Ok(Chain {
             passes,
-            targets: Vec::new(),
+            buffers: BTreeMap::new(),
+            output: None,
             quad,
+            size: (0, 0),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_pass(
         gl: &glow::Context,
         res: &Resources,
         mp: &effect::MaterialPass,
         scene: Option<&serde_json::Map<String, serde_json::Value>>,
+        scene_combos: Option<&Vec<String>>,
+        target: &Option<String>,
+        bind: &[(String, usize)],
     ) -> Result<Pass> {
         let frag_src = res
             .get_str(&format!("shaders/{}.frag", mp.shader))
             .with_context(|| format!("reading shaders/{}.frag", mp.shader))?;
         let lookup = |n: &str| res.shader(n);
-        let frag = effect::assemble(
-            &effect::expand_includes(&frag_src, &lookup)?,
-            Stage::Fragment,
-            &[],
-        );
         let vert_src = res
             .get_str(&format!("shaders/{}.vert", mp.shader))
             .unwrap_or_else(|| DEFAULT_VERTEX.to_string());
+
+        // Material combos are defaults; the scene's selection overrides them,
+        // because one material may be used in several configurations.
+        let mut defines: Vec<String> = mp
+            .combos
+            .iter()
+            .map(|(k, v)| format!("{k}={}", combo_value(v)))
+            .collect();
+        if let Some(scene) = scene_combos {
+            for d in scene {
+                let name = d.split('=').next().unwrap_or_default().to_string();
+                defines.retain(|e| !e.starts_with(&format!("{name}=")));
+                defines.push(d.clone());
+            }
+        }
+
+        let frag = effect::assemble(
+            &effect::expand_includes(&frag_src, &lookup)?,
+            Stage::Fragment,
+            &defines,
+        );
         let vert = effect::assemble(
             &effect::expand_includes(&vert_src, &lookup)?,
             Stage::Vertex,
-            &[],
+            &defines,
         );
 
-        // Both stages: the vertex shader's uniforms (`g_ModelViewProjectionMatrix`
-        // above all) are in the same program, and a pass that never sets them
-        // collapses every vertex to the origin and draws nothing.
+        // Both stages: the vertex shader's `g_ModelViewProjectionMatrix` is in the
+        // same program, and a pass that never sets it collapses every vertex to
+        // the origin and draws nothing.
         let mut uniform_bindings = effect::uniform_bindings(
             &effect::expand_includes(&frag_src, &lookup).unwrap_or_default(),
         );
@@ -397,16 +425,14 @@ impl Chain {
                 link(gl, &vert, &frag).with_context(|| format!("linking pass {}", mp.shader))?;
 
             // A uniform write goes to the *currently bound* program, so the
-            // program must be current before any of these calls - otherwise they
-            // silently touch nothing and every value stays at its default.
+            // program must be current before any of these calls.
             gl.use_program(Some(program));
 
             let mut locations = BTreeMap::new();
             for u in &uniform_bindings {
                 locations.insert(u.name.clone(), gl.get_uniform_location(program, &u.name));
             }
-            // The quad is already in clip space, so identity is the projection:
-            // the pass renders to its own full target.
+            // The quad is already in clip space, so identity is the projection.
             if let Some(loc) = locations
                 .get("g_ModelViewProjectionMatrix")
                 .cloned()
@@ -414,9 +440,6 @@ impl Chain {
             {
                 gl.uniform_matrix_4_f32_slice(Some(&loc), false, &IDENTITY);
             }
-
-            // Resolve each value uniform once; the scene supplies per-object
-            // overrides, the material its own values, the comment the default.
             for u in &uniform_bindings {
                 let Some(loc) = locations.get(&u.name).cloned().flatten() else {
                     continue;
@@ -435,14 +458,14 @@ impl Chain {
                 program,
                 uniforms: uniform_bindings,
                 locations,
-                textures: mp.textures.clone(),
+                target: target.clone(),
+                bind: bind.to_vec(),
                 blending: Blending::parse(&mp.blending),
                 shader: mp.shader.clone(),
             })
         }
     }
 
-    /// Whether the chain has any drawable pass.
     pub fn is_empty(&self) -> bool {
         self.passes.is_empty()
     }
@@ -451,10 +474,9 @@ impl Chain {
         self.passes.len()
     }
 
-    /// Run the chain over `input`, returning the texture that holds the result.
+    /// Run the chain over `input` and return the texture holding the result.
     ///
-    /// The returned texture belongs to the chain and is reused next frame; a
-    /// caller that keeps it past the next call must copy it.
+    /// The returned texture belongs to the chain and is reused next frame.
     pub fn apply(
         &mut self,
         gl: &glow::Context,
@@ -463,65 +485,115 @@ impl Chain {
         extra: &[Option<glow::Texture>],
         time: f32,
     ) -> Result<glow::Texture> {
-        for i in 0..self.passes.len() {
-            // Ping-pong between two targets, so each pass reads what the last
-            // one wrote without ever sampling the buffer it is drawing into.
-            let target = oi(i);
-            if target >= self.targets.len() {
-                let t = unsafe { Target::new(gl, input_size.0, input_size.1)? };
-                self.targets.push(t);
+        if input_size != self.size {
+            // The output changed size: every buffer is now the wrong shape.
+            for t in self.buffers.values() {
+                unsafe { t.destroy(gl) };
             }
-            if self.targets[target].width != input_size.0
-                || self.targets[target].height != input_size.1
-            {
-                unsafe {
-                    self.targets[target].destroy(gl);
-                    self.targets[target] = Target::new(gl, input_size.0, input_size.1)?;
+            self.buffers.clear();
+            if let Some(t) = self.output.take() {
+                unsafe { t.destroy(gl) };
+            }
+            self.size = input_size;
+        }
+
+        let debug = std::env::var_os("HYPRWPE_DEBUG_FX").is_some();
+        for i in 0..self.passes.len() {
+            let needs_output = self.passes[i].target.is_none();
+            if needs_output && self.output.is_none() {
+                self.output = Some(unsafe { Target::new(gl, input_size.0, input_size.1)? });
+            }
+            if let Some(name) = self.passes[i].target.clone() {
+                if let std::collections::btree_map::Entry::Vacant(slot) = self.buffers.entry(name) {
+                    slot.insert(unsafe { Target::new(gl, input_size.0, input_size.1)? });
                 }
             }
 
-            let reads_from = if i == 0 {
-                input
+            // Resolve this pass's source textures: `previous` is the chain's
+            // input, anything else is a named buffer.
+            let sources: Vec<(usize, glow::Texture)> = if self.passes[i].bind.is_empty() {
+                vec![(0, input)]
             } else {
-                self.targets[oi(i - 1)].texture
+                self.passes[i]
+                    .bind
+                    .iter()
+                    .map(|(name, slot)| {
+                        let tex = if name == "previous" {
+                            input
+                        } else {
+                            self.buffers.get(name).map(|t| t.texture).unwrap_or(input)
+                        };
+                        (*slot, tex)
+                    })
+                    .collect()
+            };
+
+            let dest = match &self.passes[i].target {
+                Some(name) => self
+                    .buffers
+                    .get(name)
+                    .map(|t| t.framebuffer)
+                    .expect("allocated above"),
+                None => self.output.as_ref().expect("allocated above").framebuffer,
             };
 
             unsafe {
-                self.draw_pass(gl, i, reads_from, input_size, extra, time)?;
+                self.draw_pass(gl, i, dest, input_size, &sources, extra, time)?;
+            }
+            if debug {
+                let pass = &self.passes[i];
+                let mut px = [0u8; 4];
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dest));
+                    gl.read_pixels(
+                        input_size.0 / 2,
+                        input_size.1 / 2,
+                        1,
+                        1,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut px)),
+                    );
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                }
+                eprintln!(
+                    "  pass {i} {} target={:?} blend={:?} center=({}, {}, {}, {})",
+                    pass.shader, pass.target, pass.blending, px[0], px[1], px[2], px[3]
+                );
             }
         }
 
-        let last = oi(self.passes.len().saturating_sub(1));
-        Ok(self.targets[last].texture)
+        // The chain's result is the last pass's buffer, which is the output when
+        // that pass named no target.
+        let last = &self.passes[self.passes.len().saturating_sub(1)];
+        let result = match &last.target {
+            Some(name) => self.buffers.get(name).map(|t| t.texture),
+            None => self.output.as_ref().map(|t| t.texture),
+        };
+        result.ok_or_else(|| anyhow::anyhow!("the chain's last pass wrote nowhere"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_pass(
         &self,
         gl: &glow::Context,
         index: usize,
-        input: glow::Texture,
-        input_size: (i32, i32),
+        dest: glow::Framebuffer,
+        size: (i32, i32),
+        sources: &[(usize, glow::Texture)],
         extra: &[Option<glow::Texture>],
         time: f32,
     ) -> Result<()> {
         let pass = &self.passes[index];
-        let target_index = oi(index);
-        // The pass writes to `targets[target_index]` while reading
-        // `targets[oi(index-1)]`, which is the other slot.
-        gl.bind_framebuffer(
-            glow::FRAMEBUFFER,
-            Some(self.targets[target_index].framebuffer),
-        );
-        gl.viewport(0, 0, input_size.0, input_size.1);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dest));
+        gl.viewport(0, 0, size.0, size.1);
         match pass.blending {
-            // The first pass has no previous result to blend with - the target
-            // is undefined memory - so it replaces it outright whatever the
-            // material says. Blending onto an undefined buffer is how a chain
-            // ends up black.
+            // A pass writing to a fresh buffer has nothing to blend with - the
+            // texture is never initialised - so a `normal` blend onto it would
+            // keep whatever alpha the shader wrote and lose the colour. Clear
+            // first, then draw.
             Blending::None => {
                 gl.disable(glow::BLEND);
-                gl.clear_color(0.0, 0.0, 0.0, 0.0);
-                gl.clear(glow::COLOR_BUFFER_BIT);
             }
             Blending::Normal => {
                 gl.enable(glow::BLEND);
@@ -533,59 +605,61 @@ impl Chain {
             }
         }
         gl.disable(glow::DEPTH_TEST);
+        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
 
         gl.use_program(Some(pass.program));
 
-        // Sampler slots: `g_Texture0` is whatever the previous pass produced
-        // unless the material names something else for it; every other slot is
-        // a texture the caller supplied.
-        for slot in 0..MAX_TEXTURES {
+        // Bind the sources the pass asked for. Any slot it does not name is left
+        // alone: the shader either ignores it or the material listed a texture
+        // the caller supplied.
+        let mut bound_slots: Vec<usize> = Vec::new();
+        for (slot, texture) in sources {
             let name = format!("g_Texture{slot}");
-            let Some(Some(loc)) = pass.locations.get(&name) else {
+            let Some(Some(loc)) = pass.locations.get(&name).cloned() else {
                 continue;
             };
-            let bound = if slot == 0 {
-                extra.first().and_then(|t| *t).unwrap_or(input)
-            } else {
-                let named = pass.textures.get(slot).and_then(|t| t.as_ref());
-                match named {
-                    Some(_) => extra.get(slot).and_then(|t| *t).unwrap_or(input),
-                    // Nothing named and nothing supplied: an empty slot samples
-                    // the previous result, which is what a pass that ignores it
-                    // expects.
-                    None => input,
-                }
-            };
-            gl.active_texture(glow::TEXTURE0 + slot as u32);
-            gl.bind_texture(glow::TEXTURE_2D, Some(bound));
-            gl.uniform_1_i32(Some(loc), slot as i32);
+            gl.active_texture(glow::TEXTURE0 + *slot as u32);
+            gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
+            gl.uniform_1_i32(Some(&loc), *slot as i32);
+            bound_slots.push(*slot);
 
-            // The resolution uniform describes the texture actually bound.
+            // The resolution uniform describes the texture actually bound; the
+            // engine's shaders derive texel-sized offsets from `.zw`.
             let res_name = format!("g_Texture{slot}Resolution");
             if let Some(rloc) = pass.locations.get(&res_name).cloned().flatten() {
-                let (w, h) = input_size;
-                // `.xy` is the size; `.zw` its reciprocal, which the engine's
-                // shaders use for texel-sized offsets.
+                let (w, h) = (size.0.max(1), size.1.max(1));
                 gl.uniform_4_f32(
                     Some(&rloc),
                     w as f32,
                     h as f32,
-                    1.0 / w.max(1) as f32,
-                    1.0 / h.max(1) as f32,
+                    1.0 / w as f32,
+                    1.0 / h as f32,
                 );
             }
+        }
+        // Material-listed textures the pass samples but the chain did not
+        // supply: bind the caller's extra textures, so a mask or a normal map
+        // reaches the shader.
+        for slot in 0..MAX_TEXTURES {
+            if bound_slots.contains(&slot) {
+                continue;
+            }
+            let Some(tex) = extra.get(slot).and_then(|t| *t) else {
+                continue;
+            };
+            let name = format!("g_Texture{slot}");
+            let Some(Some(loc)) = pass.locations.get(&name).cloned() else {
+                continue;
+            };
+            gl.active_texture(glow::TEXTURE0 + slot as u32);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.uniform_1_i32(Some(&loc), slot as i32);
         }
 
         if let Some(loc) = pass.locations.get("g_Time").cloned().flatten() {
             gl.uniform_1_f32(Some(&loc), time);
         }
-        // The engine's own `g_Time` in seconds is what most effects animate on;
-        // a whole second is also exposed separately.
-        if let Some(loc) = pass.locations.get("g_TimeSeconds").cloned().flatten() {
-            gl.uniform_1_f32(Some(&loc), time);
-        }
-        // Re-bind value uniforms whose texture bindings changed nothing, so a
-        // pass that reads a resolution it was configured with still gets it.
         let _ = &pass.uniforms;
 
         gl.bind_vertex_array(Some(self.quad.vao));
@@ -598,7 +672,10 @@ impl Chain {
     /// Release every GL object the chain owns.
     pub fn destroy(&self, gl: &glow::Context) {
         unsafe {
-            for t in &self.targets {
+            for t in self.buffers.values() {
+                t.destroy(gl);
+            }
+            if let Some(t) = &self.output {
                 t.destroy(gl);
             }
             for p in &self.passes {
@@ -609,11 +686,56 @@ impl Chain {
     }
 }
 
-/// Which of the two ping-pong targets a pass index uses.
-fn oi(index: usize) -> usize {
-    index % 2
+/// Parse an effect file's passes into their material and buffer wiring.
+fn parse_effect_passes(effect_json: &str) -> Result<Vec<PassSpec>> {
+    let ev: serde_json::Value = serde_json::from_str(effect_json).context("parsing effect.json")?;
+    let mut out = Vec::new();
+    for p in ev
+        .get("passes")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(material) = p.get("material").and_then(|m| m.as_str()) else {
+            continue;
+        };
+        let bind = p
+            .get("bind")
+            .and_then(|b| b.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|b| {
+                        Some((
+                            b.get("name")?.as_str()?.to_string(),
+                            b.get("index")?.as_u64()? as usize,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The material's own `combos` are merged in `build_pass`; an
+        // effect.json's `combos` are alternates the *editor* switches between,
+        // not a selection, so there is nothing here to apply.
+        out.push(PassSpec {
+            material: material.to_string(),
+            target: p.get("target").and_then(|t| t.as_str()).map(String::from),
+            bind,
+        });
+    }
+    Ok(out)
 }
 
+/// A combo value as a `#define` body.
+fn combo_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Bool(b) => (*b as u8).to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Which of the two ping-pong targets a pass index uses.
 /// A vertex shader for a pass that does not ship one: fullscreen quad.
 const DEFAULT_VERTEX: &str = r#"
 attribute vec3 a_Position;
@@ -1009,14 +1131,94 @@ void main() {
         }
     }
 
+    /// An effect's passes are a small render graph, and ignoring `target`/`bind`
+    /// is what made a whole wallpaper render blank: the cast pass wrote a ray
+    /// mask, the combine pass read it *and* the untouched input, and feeding each
+    /// pass the last result instead lost the image entirely.
     #[test]
-    fn the_ping_pong_alternates_and_wraps_correctly() {
-        assert_eq!(oi(0), 0);
-        assert_eq!(oi(1), 1);
-        assert_eq!(oi(2), 0);
-        // A pass reads the *other* slot to the one it writes.
-        for i in 1..6 {
-            assert_ne!(oi(i), oi(i - 1), "pass {i} must not read what it writes");
+    fn effect_passes_parse_their_buffer_wiring() {
+        let json = r#"{"passes":[
+            {"material":"materials/a.json","target":"_rt_Half1","bind":[{"name":"previous","index":0}]},
+            {"material":"materials/b.json","target":"_rt_Half2","bind":[{"name":"_rt_Half1","index":0}]},
+            {"material":"materials/c.json","bind":[{"name":"_rt_Half2","index":0},{"name":"previous","index":1}]}
+        ]}"#;
+        let specs = parse_effect_passes(json).unwrap();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].target.as_deref(), Some("_rt_Half1"));
+        assert_eq!(specs[0].bind, vec![("previous".to_string(), 0)]);
+        assert_eq!(specs[1].bind, vec![("_rt_Half1".to_string(), 0)]);
+        // The final pass names no target: it writes the chain's own output, and
+        // it reads two different buffers at two different slots.
+        assert_eq!(specs[2].target, None);
+        assert_eq!(
+            specs[2].bind,
+            vec![("_rt_Half2".to_string(), 0), ("previous".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_pass_with_no_bind_reads_the_chains_input() {
+        let specs = parse_effect_passes(r#"{"passes":[{"material":"materials/a.json"}]}"#).unwrap();
+        assert!(specs[0].bind.is_empty(), "no bind means the chain input");
+        assert_eq!(specs[0].target, None);
+    }
+
+    /// Combos are compile-time branch selectors, so they must reach the shader.
+    #[test]
+    fn scene_combos_become_defines_that_override_the_materials() {
+        // Built the way `build_pass` merges them: material first, scene last.
+        let mut defines: Vec<String> = vec!["VERTICAL=0".into(), "KERNEL=0".into()];
+        let scene = vec!["VERTICAL=1".to_string()];
+        for d in &scene {
+            let name = d.split('=').next().unwrap().to_string();
+            defines.retain(|e| !e.starts_with(&format!("{name}=")));
+            defines.push(d.clone());
+        }
+        let assembled = effect::assemble(
+            "#if VERTICAL\nfloat dir = 1.0;\n#else\nfloat dir = 0.0;\n#endif\nvoid main(){}",
+            Stage::Fragment,
+            &defines,
+        );
+        assert!(assembled.contains("#define VERTICAL=1"), "{assembled}");
+        assert_eq!(assembled.matches("VERTICAL=").count(), 1, "no stale define");
+        assert!(
+            assembled.contains("#define KERNEL=0"),
+            "the other is untouched"
+        );
+    }
+
+    #[test]
+    fn combo_values_render_as_the_shaders_if_tests_expect() {
+        assert_eq!(combo_value(&json!(1)), "1");
+        assert_eq!(combo_value(&json!(true)), "1");
+        assert_eq!(combo_value(&json!(false)), "0");
+        assert_eq!(combo_value(&json!("mode")), "mode");
+    }
+
+    /// A pass must never read the buffer it writes. The engine names buffers
+    /// explicitly (`target` + `bind`), so the check is that no pass both targets
+    /// a name and reads that same name.
+    #[test]
+    fn no_pass_reads_the_buffer_it_writes() {
+        let effects = [
+            r#"{"passes":[
+                {"material":"m/a.json","target":"A","bind":[{"name":"previous","index":0}]},
+                {"material":"m/b.json","target":"B","bind":[{"name":"A","index":0}]},
+                {"material":"m/c.json","bind":[{"name":"B","index":0},{"name":"previous","index":1}]}
+            ]}"#,
+            r#"{"passes":[
+                {"material":"m/x.json","target":"A","bind":[{"name":"previous","index":0}]},
+                {"material":"m/y.json","target":"A","bind":[{"name":"previous","index":0}]}
+            ]}"#,
+        ];
+        for json in effects {
+            for spec in parse_effect_passes(json).unwrap() {
+                let Some(target) = &spec.target else { continue };
+                assert!(
+                    !spec.bind.iter().any(|(name, _)| name == target),
+                    "pass writing {target} also reads it"
+                );
+            }
         }
     }
 }

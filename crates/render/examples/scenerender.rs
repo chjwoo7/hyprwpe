@@ -39,6 +39,7 @@ fn main() {
         .and_then(|a| Scaling::parse(a))
         .unwrap_or(Scaling::Fill);
     let effects = !args.iter().any(|a| a == "--no-effects");
+    let json_out = args.iter().any(|a| a == "--json");
 
     // `--set key=value` applies a wallpaper setting, so a property change can be
     // followed all the way to pixels: property -> effect uniform -> framebuffer.
@@ -151,7 +152,9 @@ fn main() {
     };
     player.set_effects_enabled(effects);
     let info = player.describe();
-    println!("scene: {info}");
+    if !json_out {
+        println!("scene: {info}");
+    }
 
     unsafe {
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -163,7 +166,20 @@ fn main() {
     let pixels = ctx.read_framebuffer(fbo, width, height);
 
     let stats = Stats::of(&pixels, width, height, player.clear_color());
-    println!("{stats}");
+    if json_out {
+        // One object per wallpaper, so a corpus run is a data file rather than
+        // prose nobody can diff.
+        let obj = serde_json::json!({
+            "scene": info,
+            "covered_pct": (stats.not_clear * 10000.0).round() / 100.0,
+            "mean_rgb": stats.mean,
+            "mean_alpha": stats.mean_alpha,
+            "clear": player.clear_color(),
+        });
+        println!("{obj}");
+    } else {
+        println!("{stats}");
+    }
 
     if let Some(img) = image::RgbaImage::from_raw(width as u32, height as u32, pixels) {
         // Sixteen bits is not enough for a 4K frame; fall back to RGBA8.
