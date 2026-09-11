@@ -104,51 +104,67 @@ pub fn uniform_bindings(source: &str) -> Vec<UniformBinding> {
 
 /// Engine built-ins a bundled shader assumes exist.
 ///
-/// These are not in any `#include` the creator ships — the engine injects them —
-/// so a host must provide them or nothing compiles. `texSample2D` matches
-/// `texture` on GLES3; `mul` is the HLSL row-vector multiply the shaders were
-/// written with.
-pub const PRELUDE: &str = r#"#version 300 es
-precision highp float;
-precision highp int;
-precision highp sampler2D;
-
+/// These are **not** in any `#include` the creator ships — the engine injects
+/// them — so a host must provide them or nothing compiles. Everything here is a
+/// **macro**, in three deliberate groups:
+///
+/// - **HLSL names**, because the shaders are written in Wallpaper Engine's
+///   HLSL-ish GLSL: `frac`, `saturate`, `lerp`, `mul`, `atan2`, `mod2`.
+/// - **Type-generic forms**, so no overload can collide with the shader's own
+///   definitions (`saturate(x)` is `clamp(x, 0.0, 1.0)`, which GLSL accepts for
+///   any `genType`). This is not cosmetic: the engine's own `common.h` defines
+///   `hsv2rgb`, `rgb2hsv`, `rotateVec2` and `greyscale` as *functions*, and a
+///   function of the same name in the prelude is a hard
+///   "function is already defined" error on the driver. Those four therefore
+///   live only in `common.h` and are **not** repeated here.
+/// - **Sampler aliases**, since GLES3 spells it `texture`/`textureLod`.
+///
+/// Every definition is `#ifndef`-guarded, so a shader or include that provides
+/// its own cannot conflict.
+pub const PRELUDE: &str = r#"
+#ifndef mul
 #define mul(a, b) ((b) * (a))
-float saturate(float x) { return clamp(x, 0.0, 1.0); }
-vec2 saturate(vec2 x) { return clamp(x, vec2(0.0), vec2(1.0)); }
-vec3 saturate(vec3 x) { return clamp(x, vec3(0.0), vec3(1.0)); }
-vec4 saturate(vec4 x) { return clamp(x, vec4(0.0), vec4(1.0)); }
-float lerp(float a, float b, float t) { return mix(a, b, t); }
-vec2 lerp(vec2 a, vec2 b, vec2 t) { return mix(a, b, t); }
-vec3 lerp(vec3 a, vec3 b, vec3 t) { return mix(a, b, t); }
-vec4 lerp(vec4 a, vec4 b, vec4 t) { return mix(a, b, t); }
-vec2 atan2(vec2 a, vec2 b) { return atan(a, b); }
-float mod2(float a, float b) { return mod(a, b); }
+#endif
+#ifndef frac
+#define frac(x) fract(x)
+#endif
+#ifndef saturate
+#define saturate(x) clamp(x, 0.0, 1.0)
+#endif
+#ifndef lerp
+#define lerp(a, b, t) mix(a, b, t)
+#endif
+#ifndef atan2
+#define atan2(a, b) atan(a, b)
+#endif
+#ifndef mod2
+#define mod2(a, b) mod(a, b)
+#endif
+// `CASTn` promotes to an n-vector, so it must broadcast: the corpus calls
+// `CAST2(1.409)` on a scalar inside a `vec2` expression, which only compiles if
+// these are overloaded constructors rather than a plain pass-through.
+// Integer overloads matter as much as the float ones: the corpus calls
+// `CAST2(3)`, and GLSL will not implicitly widen `int` to `float` the way HLSL
+// does, so a missing overload is a hard error rather than a quiet conversion.
+vec2 CAST2(int v) { return vec2(float(v)); }
+vec2 CAST2(float v) { return vec2(v); }
 vec2 CAST2(vec2 v) { return v; }
+vec3 CAST3(int v) { return vec3(float(v)); }
+vec3 CAST3(float v) { return vec3(v); }
 vec3 CAST3(vec3 v) { return v; }
+vec4 CAST4(int v) { return vec4(float(v)); }
+vec4 CAST4(float v) { return vec4(v); }
 vec4 CAST4(vec3 v) { return vec4(v, 1.0); }
 vec4 CAST4(vec4 v) { return v; }
-vec2 rotateVec2(vec2 v, float r) {
-    vec2 cs = vec2(cos(r), sin(r));
-    return vec2(v.x * cs.x - v.y * cs.y, v.x * cs.y + v.y * cs.x);
-}
-float greyscale(vec3 color) { return dot(color, vec3(0.11, 0.59, 0.3)); }
-vec3 hsv2rgb(vec3 c) {
-    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-}
-vec3 rgb2hsv(vec3 RGB) {
-    vec4 P = (RGB.g < RGB.b) ? vec4(RGB.bg, -1.0, 2.0 / 3.0) : vec4(RGB.gb, 0.0, -1.0 / 3.0);
-    vec4 Q = (RGB.r < P.x) ? vec4(P.xyw, RGB.r) : vec4(RGB.r, P.yzx);
-    float C = Q.x - min(Q.w, Q.y);
-    float H = abs((Q.w - Q.y) / (6.0 * C + 1e-10) + Q.z);
-    vec3 HCV = vec3(H, C, Q.x);
-    float S = HCV.y / (HCV.z + 1e-10);
-    return vec3(HCV.x, S, HCV.z);
-}
+#ifndef texSample2D
 #define texSample2D(s, uv) texture(s, uv)
+#endif
+#ifndef texSample2DLevel
 #define texSample2DLevel(s, uv, l) textureLod(s, uv, l)
+#endif
+#ifndef texSample2DLod
+#define texSample2DLod(s, uv, l) textureLod(s, uv, l)
+#endif
 "#;
 
 /// Expand `#include "x.h"` recursively.
@@ -209,12 +225,107 @@ fn expand_inner(
     Ok(out)
 }
 
+/// Combo macros a stage needs defined.
+///
+/// A shader guards its variants with `#if SOME_COMBO`, naming the combo in each
+/// uniform's JSON comment (`{"combo":"SOME_COMBO"}`). GLSL ES rejects an `#if`
+/// over an undefined name where HLSL treated it as 0, so a host that does not
+/// select a combo must still define it. `0` is the honest default: it is what
+/// "this option is off" means, and the shader's own `#else` branch then applies.
+pub fn combo_defines(source: &str) -> Vec<String> {
+    let mut names: Vec<String> = uniform_bindings(source)
+        .into_iter()
+        .filter_map(|u| u.combo)
+        .collect();
+    // Also catch combos referenced in `#if` but not declared by a uniform: some
+    // effects branch on a name the material sets instead.
+    for line in source.lines() {
+        let line = line.trim_start();
+        let rest = match line
+            .strip_prefix("#if ")
+            .or_else(|| line.strip_prefix("#if\t"))
+        {
+            Some(r) => r.trim(),
+            None => continue,
+        };
+        // `#if NAME`, `#if NAME == 1`, `#if !NAME`, `#if defined(NAME)`
+        for token in rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if token.is_empty() || token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            // Skip GLSL's own defined/integer-constant helpers.
+            if matches!(token, "defined" | "true" | "false") {
+                continue;
+            }
+            names.push(token.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|n| format!("#ifndef {n}\n#define {n} 0\n#endif"))
+        .collect()
+}
+
 /// Build the final, compilable source for one stage.
 ///
-/// Exactly one `#version 300 es` line ends up first: any the shader states
-/// itself is dropped (a `#version` anywhere but the top is a compile error), the
-/// prelude follows without its own, and the shader body comes last. WE files also
-/// start with a BOM and CRLF, which are normalised away.
+/// The pieces go in the only order GLSL accepts and in the order the engine's
+/// own files assume:
+///
+/// 1. `#version` — first line, once. Any the shader states is dropped, because a
+///    `#version` anywhere but the top is itself a compile error.
+/// 2. Precision and the fragment output. The shaders write `gl_FragColor`, which
+///    is not GLES 3, so it is aliased to a declared `out`.
+/// 3. The prelude macros and this stage's combo defaults.
+/// 4. The body, with `#include`s already expanded.
+///
+/// WE files start with a BOM and use CRLF; both are normalised away, since a
+/// stray `\r` inside a `#define` is a genuinely confusing error.
+/// The sampler uniforms the engine declares for every shader.
+///
+/// A shader's `#include`d helper may *use* `g_Texture0` while the shader itself
+/// declares it further down the file - `common_blur.h` does exactly that - and
+/// GLSL requires declaration before use, so the host declares the whole set
+/// first. Any declaration the shader repeats is removed by
+/// [`strip_texture_uniforms`], because a duplicate uniform is an error.
+pub const TEXTURE_UNIFORMS: usize = 8;
+
+fn texture_uniform_block() -> String {
+    let mut out = String::new();
+    for i in 0..TEXTURE_UNIFORMS {
+        out.push_str(&format!(
+            "uniform sampler2D g_Texture{i};\nuniform vec4 g_Texture{i}Resolution;\n"
+        ));
+    }
+    out
+}
+
+/// Drop the shader's own declarations of the injected samplers.
+///
+/// Matching on the declaration line is safe here: the injected set has one fixed
+/// type per name, so a removed line and the header's version are equivalent.
+fn strip_texture_uniforms(body: &str) -> String {
+    body.lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("uniform ") else {
+                return true;
+            };
+            let mut parts = rest.split_whitespace();
+            let (Some(_ty), Some(name)) = (parts.next(), parts.next()) else {
+                return true;
+            };
+            let name = name.trim_end_matches(';');
+            let injected = ["sampler2D", "vec4"].contains(&_ty);
+            let is_g_texture = name.starts_with("g_Texture")
+                && name[9..].chars().next().is_some_and(|c| c.is_ascii_digit());
+            !(injected && is_g_texture)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn assemble(source: &str, stage: Stage, defines: &[String]) -> String {
     let body = source.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     let body: String = body
@@ -222,21 +333,24 @@ pub fn assemble(source: &str, stage: Stage, defines: &[String]) -> String {
         .filter(|l| !l.trim_start().starts_with("#version"))
         .collect::<Vec<_>>()
         .join("\n");
+    let body = strip_texture_uniforms(&body);
 
-    let prelude_body: String = PRELUDE
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("#version"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let mut out = String::with_capacity(body.len() + prelude_body.len() + 512);
+    let mut out = String::with_capacity(body.len() + PRELUDE.len() + 512);
     out.push_str("#version 300 es\n");
     if stage == Stage::Fragment {
-        // WE writes `gl_FragColor`, which is not GLES3.
+        out.push_str("precision highp float;\nprecision highp int;\n");
+        out.push_str("layout(location = 0) out vec4 wp_FragColor;\n");
         out.push_str("#define gl_FragColor wp_FragColor\n");
     }
-    out.push_str(&prelude_body);
+    out.push_str(PRELUDE);
     out.push('\n');
+    // Both stages: a vertex shader's include may sample just as a fragment
+    // shader's does (`blend.vert` reads `g_Texture1Resolution`).
+    out.push_str(&texture_uniform_block());
+    for d in combo_defines(&body) {
+        out.push_str(&d);
+        out.push('\n');
+    }
     for d in defines {
         out.push_str("#define ");
         out.push_str(d);
@@ -397,6 +511,90 @@ uniform mat4 g_ModelViewProjectionMatrix;
         // Exactly one #version, and it is the first line.
         assert_eq!(out.matches("#version").count(), 1);
         assert!(out.trim_start().starts_with("#version 300 es"));
+    }
+
+    /// The GPU found this: a helper `common.h` defines must not be repeated in
+    /// the prelude, or the driver reports "function is already defined".
+    #[test]
+    fn the_prelude_does_not_redefine_the_engines_own_helpers() {
+        for name in ["hsv2rgb", "rgb2hsv", "rotateVec2", "greyscale"] {
+            assert!(
+                !PRELUDE.contains(name),
+                "{name} is defined by the engine's common.h; repeating it fails to compile"
+            );
+        }
+        // ...while the HLSL names the engine injects and no include provides
+        // must be present.
+        for name in ["frac", "saturate", "lerp", "mul", "texSample2D"] {
+            assert!(PRELUDE.contains(name), "{name} must come from the host");
+        }
+    }
+
+    /// GLSL ES rejects `#if` over an undefined name where HLSL read it as 0.
+    #[test]
+    fn combo_macros_are_defined_for_the_shaders_if_blocks() {
+        let src = "uniform int g_Specular; // {\"combo\":\"SPECULAR\"}\n#if NORMALMAP\n#endif\n";
+        let defs = combo_defines(src);
+        assert!(defs.iter().any(|d| d.contains("SPECULAR")), "{defs:?}");
+        assert!(defs.iter().any(|d| d.contains("NORMALMAP")), "{defs:?}");
+        // Each is guarded so a shader that defines its own still wins.
+        assert!(defs.iter().all(|d| d.starts_with("#ifndef ")), "{defs:?}");
+        assert!(defs.iter().all(|d| d.ends_with("#endif")));
+    }
+
+    /// A shader's `#include`d helper may use `g_Texture0` before the shader
+    /// declares it, which GLSL rejects - so the host declares the set first and
+    /// the shader's own duplicate is removed.
+    #[test]
+    fn sampler_uniforms_are_injected_before_the_body_and_not_duplicated() {
+        let src =
+            "uniform sampler2D g_Texture0; // {\"material\":\"framebuffer\"}\nvoid main() {}\n";
+        let out = assemble(src, Stage::Fragment, &[]);
+        let declarations = out.matches("uniform sampler2D g_Texture0;").count();
+        assert_eq!(declarations, 1, "declared exactly once:\n{out}");
+        // The injected block comes before the body, so an include can use it.
+        let decl_at = out.find("uniform sampler2D g_Texture0;").unwrap();
+        let main_at = out.find("void main()").unwrap();
+        assert!(decl_at < main_at, "the sampler must precede its use");
+        // Every resolution uniform the shaders read is present too.
+        assert!(out.contains("uniform vec4 g_Texture0Resolution;"));
+    }
+
+    #[test]
+    fn a_vertex_stage_gets_the_samplers_as_well() {
+        let out = assemble("void main() {}", Stage::Vertex, &[]);
+        assert!(out.contains("uniform sampler2D g_Texture0;"));
+        assert!(out.contains("uniform vec4 g_Texture1Resolution;"));
+    }
+
+    /// `CASTn` must broadcast, because the corpus calls it on a bare integer.
+    #[test]
+    fn cast_helpers_accept_integers_and_floats_and_vectors() {
+        // The corpus calls these on bare integers (`CAST2(3)`), on floats and on
+        // vectors, and GLSL resolves overloads by exact type - so all three must
+        // exist or the call is a hard error.
+        for decl in [
+            "vec2 CAST2(int v)",
+            "vec2 CAST2(float v)",
+            "vec2 CAST2(vec2 v)",
+            "vec3 CAST3(int v)",
+            "vec3 CAST3(float v)",
+            "vec4 CAST4(int v)",
+            "vec4 CAST4(float v)",
+            "vec4 CAST4(vec3 v)",
+            "vec4 CAST4(vec4 v)",
+        ] {
+            assert!(PRELUDE.contains(decl), "missing overload: {decl}");
+        }
+    }
+
+    #[test]
+    fn the_assembled_header_is_the_only_version_and_has_one_output() {
+        let out = assemble("#version 300 es\nvoid main() {}", Stage::Fragment, &[]);
+        assert_eq!(out.matches("#version").count(), 1);
+        assert!(out.trim_start().starts_with("#version 300 es"));
+        assert_eq!(out.matches("out vec4 wp_FragColor;").count(), 1);
+        assert!(out.contains("#define gl_FragColor wp_FragColor"));
     }
 
     #[test]

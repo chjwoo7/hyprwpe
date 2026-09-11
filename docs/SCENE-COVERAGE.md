@@ -220,6 +220,41 @@ gated the entire library: includes resolve both bare and under `shaders/` (the
 engine keeps `common*.h` there and every effect includes at least one), and
 `usershadervalues` binds a uniform to a user property.
 
+Assembling a source is not compiling it, and the difference turned out to matter.
+`cargo run -p hyprwpe-render --example fxcompile` gets a real GLES 3 context
+through **surfaceless EGL** — no window, no compositor, nothing on the user's
+screen — and compiles every stage:
+
+| | |
+| --- | --- |
+| shader stages compiled | **1338** |
+| shader stages rejected | 56 |
+| effects compiling completely | **35 of 91** |
+
+The driver's own log found four bugs in the assembler that string-level
+validation could never see, each now fixed and covered by a test:
+
+- The prelude **redefined `hsv2rgb`, `rgb2hsv`, `rotateVec2` and `greyscale`**,
+  which the engine's own `common.h` defines as functions —
+  `error C1013: function "hsv2rgb" is already defined`. The prelude is now
+  macros only, `#ifndef`-guarded, and those four live solely in `common.h`.
+- `frac(...)` is HLSL; GLSL ES has `fract`.
+- A shader's combo guards (`#if KERNEL == 0`) were undefined, and GLSL ES rejects
+  an `#if` over an undefined name where HLSL read it as 0 — so combo names are
+  now defaulted to 0, which is what "option off" means.
+- `CASTn` is a **broadcast** (`CAST2(1.409)` in a `vec2` expression), not an
+  identity, and needs integer as well as float overloads; and a shader's
+  `#include`d helper can *use* `g_Texture0` before the shader declares it, so the
+  host injects the sampler set ahead of the body and drops the shader's own
+  duplicate declaration (a duplicate uniform is itself an error).
+
+What is left is one honest class: **HLSL's implicit int↔float promotion** (62 of
+the remaining errors, e.g. `implicit cast from "int" to "float"`), plus a handful
+of `sample`-as-an-identifier collisions and `max(int, vec3)`. Those need a real
+HLSL→GLSL typing pass, not more string shims; until it exists 56 effects are
+reported as unsupported rather than rendered wrongly, which is what the honesty
+rule below requires.
+
 What remains for pixels is the GL side: a framebuffer ping-pong that runs each
 object's effect passes in order, with the constants resolved from the scene and
 the object's own `constantshadervalues`.
