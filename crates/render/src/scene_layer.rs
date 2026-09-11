@@ -1576,22 +1576,24 @@ pub fn resolve_puppet_file(pkg: &Resources, image_ref: &str) -> Option<String> {
 /// already carries an image extension too.
 fn resolve_texture_entry(pkg: &Resources, material_path: &str, name: &str) -> Option<String> {
     let _ = material_path;
-    if is_image_file(name) {
-        let rooted = format!("materials/{name}");
-        let direct = name.to_string();
-        return pkg
-            .get(&rooted)
-            .is_some()
-            .then_some(rooted)
-            .or_else(|| pkg.get(&direct).is_some().then_some(direct));
-    }
-    for ext in [".tex", ".png", ".jpg", ".jpeg", ".tga", ".bmp", ""] {
-        let cand = format!("materials/{name}{ext}");
-        if pkg.get(&cand).is_some() {
-            return Some(cand);
+    // A texture name is written three ways in the corpus: as a file relative to
+    // the package (`sky/clouds.png`), as a bare name the entry supplies the
+    // extension for (`cat_rb` -> `materials/cat_rb.tex`), and as a name that
+    // *looks* like an image but is only a base - a creator's own asset embedded
+    // behind it (`ojedehfdz.jpeg` -> `materials/ojedehfdz.jpeg.tex`).
+    //
+    // Branching on whether the name looks like an image handled the first and
+    // missed the third, because a name that already ends in `.jpeg` never got
+    // the extension tried. Trying the name as written, then with each extension,
+    // covers all three without having to guess which kind it is.
+    let mut candidates: Vec<String> = Vec::new();
+    for root in ["materials/", ""] {
+        candidates.push(format!("{root}{name}"));
+        for ext in [".tex", ".png", ".jpg", ".jpeg", ".tga", ".bmp"] {
+            candidates.push(format!("{root}{name}{ext}"));
         }
     }
-    None
+    candidates.into_iter().find(|c| pkg.get(c).is_some())
 }
 
 /// Load the texture bytes for a resolved entry and decode to RGBA.
@@ -1832,6 +1834,37 @@ mod tests {
         assert_eq!(
             resolve_texture_file(&pkg5, "materials/grid.json").as_deref(),
             Some("materials/grid.png")
+        );
+    }
+
+    /// A texture name that already ends in an image extension must still get
+    /// `.tex` tried. Creators embed their own assets, so a material naming
+    /// `photo.jpeg` may have it stored as `materials/photo.jpeg.tex` - and
+    /// deciding "this looks like an image, don't append an extension" dropped
+    /// those layers silently.
+    #[test]
+    fn resolve_texture_entry_appends_tex_to_an_image_looking_name() {
+        let pkg = make_test_pkg(&[("materials/photo.jpeg.tex", b"tex-data")]);
+        assert_eq!(
+            resolve_texture_entry(&pkg, "materials/photo.json", "photo.jpeg").as_deref(),
+            Some("materials/photo.jpeg.tex")
+        );
+
+        // The name as written still wins when it is really there.
+        let pkg = make_test_pkg(&[
+            ("materials/bg.png", b"png"),
+            ("materials/bg.png.tex", b"tex"),
+        ]);
+        assert_eq!(
+            resolve_texture_entry(&pkg, "materials/bg.json", "bg.png").as_deref(),
+            Some("materials/bg.png")
+        );
+
+        // And a bare name still resolves through `materials/`.
+        let pkg = make_test_pkg(&[("materials/cat_rb.tex", b"tex")]);
+        assert_eq!(
+            resolve_texture_entry(&pkg, "materials/cat_rb.json", "cat_rb").as_deref(),
+            Some("materials/cat_rb.tex")
         );
     }
 

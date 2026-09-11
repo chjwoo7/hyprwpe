@@ -89,14 +89,29 @@ Ordered by wallpapers unlocked per unit of work.
 **1. Container, scene graph, image objects.** Parse `scene.pkg` and `scene.json`,
 build the object tree, draw image layers with transforms.
 
-*Status (measured 2026-09, 75 packages, 723 image objects):* the image-object
-path is implemented end to end.
-- Texture-chain resolution (object -> `models/*.json` -> `materials/*.json`
-  -> `materials/<name>.tex`) resolves **413/723** image references.
-- Of those, **366 decode** to RGBA (embedded PNG/JPEG inside the `TEXV0005`
-  container decodes via the `image` crate; raw-BC payloads are best-effort).
-- **44/75 scenes have every image object decode**; **73/75** have at least one
-  image object decoding (so they show their background rather than nothing).
+*Status (measured 2026-09, 75 packages):* the image-object path is implemented
+end to end, and measured rather than asserted.
+- **524/524 visible image objects resolve and draw.** The denominator counts the
+  image-kind objects a scene wants drawn; objects hidden by a property gate are
+  not counted against us. A model naming a `puppet` is drawn as a skinned mesh
+  rather than a quad, so both count as resolved.
+- **75/75 scenes resolve every one of them**, up from 44 when the count was last
+  written.
+- **915/915 unique textures decode.** The `.tex` revisions (`TEXB0002/3/4`) hold
+  an LZ4 block whose layout is stated relative to the block; the format is
+  identified by the declared size, because the container has no format field. See
+  [`FORMATS.md`](FORMATS.md#texv0005-container--confirmed).
+- Coverage, the check that pixels came out and not just that loading succeeded:
+  median **100%** of the frame is drawn, **59/75** scenes at 99.5% or better.
+
+Two measurements, because either alone lies: resolution counts say the chain
+resolved, coverage says the result reached the screen. The four scenes under 10%
+are dark by design - one is 94% black in its own shipped preview.
+
+`tools/measure_scenes.sh` renders every scene headlessly and writes one JSON line
+per wallpaper, and `crates/core/examples/texaudit.rs` reports each texture's
+revision and whether it decoded. Both exist so the next gap shows up as a number
+rather than as a wallpaper that quietly looks wrong.
 
 The layout model validated against real scenes: object `origin` is the quad
 centre, quad extent is `size * scale` in design units, `general.
