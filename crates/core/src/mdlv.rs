@@ -43,6 +43,23 @@ pub struct PuppetModel {
     pub animations: Vec<PuppetAnimation>,
 }
 
+/// One bone influence on a vertex.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Influence {
+    /// Index into `PuppetModel::bones`.
+    pub bone: u32,
+    /// Weight in `[0, 1]`. A weight of zero means the slot is unused and the
+    /// bone index is meaningless.
+    pub weight: f32,
+}
+
+impl Influence {
+    /// Whether this slot actually influences the vertex.
+    pub fn is_used(&self) -> bool {
+        self.weight > 0.0
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
@@ -50,10 +67,16 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     /// Bytes per vertex record.
     pub stride: usize,
-    /// Raw per-vertex records, `stride / 4` floats each. Kept so per-vertex
-    /// attributes whose slots are not yet pinned (skin weights) can be read
-    /// without re-parsing.
-    pub records: Vec<Vec<f32>>,
+    /// Four bone influences per vertex, parallel to `positions`. Empty when the
+    /// model has no skinning block (e.g. a flat, rig-less mesh).
+    pub skin: Vec<[Influence; 4]>,
+}
+
+impl Mesh {
+    /// Whether the mesh carries per-vertex skinning.
+    pub fn is_skinned(&self) -> bool {
+        self.skin.len() == self.positions.len() && !self.skin.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -302,6 +325,34 @@ fn winding_consistency(verts: &[[f32; 2]], indices: &[u32]) -> f32 {
     pos.max(neg) as f32 / total as f32
 }
 
+/// Extract the four bone influences packed into one vertex record.
+///
+/// The record ends with the UV pair; immediately before it sit **two
+/// contiguous four-slot blocks** — bone indices (stored as raw `u32`) then
+/// weights (`f32`). Anchoring on the UV pair means this holds for every record
+/// size seen (13 and 20 floats), and a record too short to hold the blocks (5
+/// floats: position + UV only) simply has none.
+fn skin_from_record(v: &[f32]) -> Option<[Influence; 4]> {
+    let nf = v.len();
+    // Need the position triple (3) before the index block starts at `nf - 10`.
+    let idx = nf.checked_sub(10)?;
+    if idx < 3 {
+        return None;
+    }
+    let wt = nf - 6;
+    if wt + 4 > nf - 2 {
+        return None;
+    }
+    let mut out = [Influence::default(); 4];
+    for (k, slot) in out.iter_mut().enumerate() {
+        // The index is a raw u32 bit pattern; `to_bits` recovers it exactly
+        // from the float slot it was read into.
+        slot.bone = v[idx + k].to_bits();
+        slot.weight = v[wt + k];
+    }
+    Some(out)
+}
+
 /// Locate and parse the mesh block by validating self-consistent invariants.
 ///
 /// The block is not a tagged section, so it is found by probing the bytes just
@@ -365,7 +416,8 @@ fn parse_mesh(d: &[u8]) -> Option<Mesh> {
 
             let mut positions = Vec::with_capacity(n);
             let mut uvs = Vec::with_capacity(n);
-            let mut records = Vec::with_capacity(n);
+            let mut skin = Vec::new();
+            let mut skinned = true;
             let mut ok = true;
             for i in 0..n {
                 let Some(v) = read_f32s(d, vs + i * stride, nf) else {
@@ -374,10 +426,18 @@ fn parse_mesh(d: &[u8]) -> Option<Mesh> {
                 };
                 positions.push([v[0], v[1], v[2]]);
                 uvs.push([v[nf - 2], v[nf - 1]]);
-                records.push(v);
+                match skin_from_record(&v) {
+                    Some(s) => skin.push(s),
+                    None => skinned = false,
+                }
             }
             if !ok {
                 continue;
+            }
+            if !skinned {
+                // A record too short for the blocks means the whole mesh is
+                // rig-less, so drop any partial skin.
+                skin.clear();
             }
 
             let pos_xy: Vec<[f32; 2]> = positions.iter().map(|p| [p[0], p[1]]).collect();
@@ -395,7 +455,7 @@ fn parse_mesh(d: &[u8]) -> Option<Mesh> {
                         uvs,
                         indices,
                         stride,
-                        records,
+                        skin,
                     },
                 ));
             }
@@ -721,5 +781,37 @@ mod tests {
         assert!((winding_consistency(&verts, &[0, 1, 2]) - 1.0).abs() < 1e-6);
         // An index that falls outside the vertex list is skipped, not panicking.
         assert_eq!(winding_consistency(&verts, &[0, 1, 99]), 0.0);
+    }
+
+    #[test]
+    fn skin_block_is_read_from_the_eight_slots_before_the_uvs() {
+        // 13-float record: pos(3) indices(4) weights(4) uv(2).
+        let mut v = vec![0.0f32; 13];
+        v[0..3].copy_from_slice(&[1.0, 2.0, 3.0]);
+        // Bone indices are raw u32 bits stored in float slots.
+        for (k, b) in [7u32, 8, 9, 10].iter().enumerate() {
+            v[3 + k] = f32::from_bits(*b);
+        }
+        v[7..11].copy_from_slice(&[0.5, 0.25, 0.25, 0.0]);
+        let s = skin_from_record(&v).expect("has a skin block");
+        assert_eq!([s[0].bone, s[1].bone, s[2].bone, s[3].bone], [7, 8, 9, 10]);
+        assert!((s.iter().map(|i| i.weight).sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(!s[3].is_used(), "zero weight slot is unused");
+
+        // 20-float record: the same two blocks shift with the record size.
+        let mut v = vec![0.0f32; 20];
+        v[10] = f32::from_bits(3);
+        v[14] = 1.0;
+        let s = skin_from_record(&v).expect("has a skin block");
+        assert_eq!(s[0].bone, 3);
+        assert!((s[0].weight - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_record_without_room_for_skin_has_none() {
+        // 5-float record (position + UV only) cannot hold the blocks.
+        assert!(skin_from_record(&[0.0; 5]).is_none());
+        // Nor can a record that would place the index block inside position.
+        assert!(skin_from_record(&[0.0; 12]).is_none());
     }
 }

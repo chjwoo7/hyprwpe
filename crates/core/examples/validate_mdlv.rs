@@ -30,6 +30,8 @@ fn main() {
     let mut ok = 0usize;
     let mut total = 0usize;
     let mut versions: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    let mut skinned = 0usize;
+    let mut skin_violations = 0usize;
     let mut failures = Vec::new();
 
     for path in &files {
@@ -44,10 +46,39 @@ fn main() {
                     failures.push(format!("{}: no usable mesh", path.display()));
                 }
                 *versions.entry(m.version).or_default() += 1;
+
+                // Skin invariants, checked the same way as the reference
+                // prototype: weights sum to one, and every used slot names a
+                // bone that exists.
+                let mut bad = 0usize;
+                if m.mesh.is_skinned() {
+                    skinned += 1;
+                    for inf in &m.mesh.skin {
+                        let sum: f32 = inf.iter().map(|i| i.weight).sum();
+                        if (sum - 1.0).abs() > 1e-4 {
+                            bad += 1;
+                        }
+                        for i in inf.iter().filter(|i| i.is_used()) {
+                            if i.bone as usize >= m.bones.len() {
+                                bad += 1;
+                            }
+                        }
+                    }
+                }
+                skin_violations += bad;
+                if bad > 0 {
+                    failures.push(format!("{}: {bad} skin violations", path.display()));
+                }
+
                 if verbose {
                     let tris = m.mesh.indices.len() / 3;
+                    let influ = if m.mesh.is_skinned() {
+                        "skin=4"
+                    } else {
+                        "skin=-"
+                    };
                     println!(
-                        "{:<44} v{:<4} verts={:<6} tris={:<6} bones={:<4} anims={:<3} stride={}",
+                        "{:<44} v{:<4} verts={:<6} tris={:<6} bones={:<4} anims={:<3} stride={:<4} {influ}",
                         path.file_name().unwrap().to_string_lossy(),
                         m.version,
                         m.mesh.positions.len(),
@@ -70,7 +101,8 @@ fn main() {
     }
     println!("\nparsed with a usable mesh: {ok}/{total}");
     println!("revisions seen: {versions:?}");
-    if ok != total {
+    println!("skinned meshes: {skinned} (skin violations: {skin_violations})");
+    if ok != total || skin_violations != 0 {
         std::process::exit(1);
     }
 }

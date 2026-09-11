@@ -228,11 +228,97 @@ files**, and each section's own numeric suffix (`0001`…`0006`) says how to rea
 it — so support for a new version is a table entry, never a per-wallpaper
 branch. Reading one specific file's offsets would cover 14/48 at best.
 
-Concretely: the mesh replaces the quad, is drawn `translucent` + `nocull` with
-depth test off, and a model may carry a `cropoffset`. **Not yet implemented** —
-such a model currently renders as its static material texture. `tools/mdl_corpus.py`
-extracts every `.mdl` for cross-version testing; `tools/extract_pkg.py` pulls a
-single entry from a package.
+### MDLV sections — confirmed
+
+**Section framing** (every `MD??NNNN` section, all five versions):
+
+```
+char[8]  tag                e.g. "MDLS0004"; the last four digits are the revision
+u8       0
+u32      next               absolute offset of the following section
+u16      count              element count for this section
+u16      0                  purpose unknown; zero in every file seen
+```
+
+A section ends where the next one begins — taken from the file, never assumed.
+The final section's `next` is `filesize - 1`, so the last byte belongs to nothing.
+
+**Mesh.** Not a tagged section, so it is located by validating invariants rather
+than by offset: after the material path, the first candidate whose `u32
+vertexBytes` divides by the record count, whose record stride divides
+`vertexBytes` exactly, and whose position triple **and** trailing UV pair both
+produce consistent triangle winding. Then:
+
+```
+u32 vertexBytes             records follow, tightly packed
+u32 indexBytes              u16 (or u32) indices follow
+stride = vertexBytes / (max index + 1)        20 / 52 / 80 bytes observed
+```
+
+**Vertex record** (`nf = stride / 4` floats):
+
+| Slots | Meaning |
+| --- | --- |
+| `f[0..2]` | position xyz |
+| `f[3..8]`, `f[9]` | stride-80 only: normal, tangent (both unit), one constant `1.0` |
+| `f[nf-10..nf-6]` | **4 bone indices**, stored as raw `u32` bit patterns |
+| `f[nf-6..nf-2]` | **4 skin weights** (`f32`), summing to 1.0 |
+| `f[nf-2..nf-1]` | UV |
+
+The skin block is **two contiguous four-slot blocks immediately before the UV
+pair**, so a record too short for them (5 floats: position + UV only) simply has
+none. A zero weight means the slot is unused and its index is meaningless. This
+holds for **47/47 skinned corpus files, ~40k vertices, zero violations** of
+"weights sum to 1.0" and "every used index is below the bone count".
+
+**Skeleton** (`MDLS`): `count` bones, each
+
+```
+u8[5]  lead                 fixed per bone (0x00 01 00 00 00 in MDLS0004)
+i32    parent               -1 for a root
+u32    blockBytes           size of the matrix block (64 observed)
+f32[16] matrix              bind transform, row-major, translation in the last row
+zstring params
+```
+
+followed by an undecoded per-vertex array whose length is `section_end - pos`.
+
+**Attachments** (`MDAT`): `u16 kind`, `zstring name`, `f32[16]` matrix.
+
+**Animation** (`MDLA`): per animation `u32, u32, zstring name, zstring mode,
+f32 fps, u32 length, u32, u32 bone_count`; then per bone `u32, u32 bytes` of
+keyframes; then a short trailer whose length is recovered from the file (the
+value that makes the list end exactly on the section end).
+
+**Keyframe** (36 bytes): `f32 position.xyz`, `u32`, `u32`, `f32 rotation`,
+`f32 scale.xyz`. `keyframe_count == length + 1` held for **674/674 corpus
+tracks**.
+
+### Puppet skinning — confirmed
+
+Two facts make skinning exact, both verified from the bytes and geometry:
+
+1. **A bone's stored matrix is its local transform**, relative to its parent.
+   Composing along the parent chain gives the rest world matrix. Verified
+   geometrically: composed, each vertex's dominant bone lands about **3x** closer
+   to it than if the stored matrix were read as absolute (Akali mean distance
+   199 vs 659 model units).
+2. **An animation keyframe is the same local transform**, and frame 0 *usually*
+   equals the bind pose (Butterfly matches to 7.8e-9). This is a convention, not
+   a guarantee — `Car_puppet` authors a first key away from rest — so the pose is
+   always taken from the keyframes, never from the authored mesh.
+
+Then, per bone, `skin = animated_world * inverse(rest_world)` and each vertex is
+the weighted blend of its influences (linear blend skinning). Validated offline
+by `cargo run -p hyprwpe-render --example skinpreview -- --corpus <dir>`:
+**46 skinned models, 0 failures** — every pose across every animation stays
+finite and bounded. Akali's loop returns exactly to rest at `t = length / fps`
+(drift 0.0), and its frame-0 offset is 0.0.
+
+The mesh replaces the quad and is drawn `translucent` + `nocull` with depth test
+off; a model may carry a `cropoffset`. `tools/mdl_corpus.py` extracts every
+`.mdl` for cross-version testing; `tools/extract_pkg.py` pulls a single entry
+from a package.
 
 ## `.tex` textures — confirmed
 

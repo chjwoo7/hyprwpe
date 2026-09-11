@@ -150,6 +150,109 @@ impl Mat4 {
             m.e, m.f, 0.0, 1.0, //
         ])
     }
+
+    /// Translation, Z rotation then scale — the local transform a puppet bone
+    /// stores, built in this crate's column-vector convention.
+    pub fn from_trs(t: [f32; 3], rot: f32, s: [f32; 3]) -> Self {
+        let c = rot.cos();
+        let sn = rot.sin();
+        Mat4([
+            s[0] * c,
+            s[0] * sn,
+            0.0,
+            0.0,
+            -s[1] * sn,
+            s[1] * c,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            s[2],
+            0.0,
+            t[0],
+            t[1],
+            t[2],
+            1.0,
+        ])
+    }
+
+    /// Build from the 4x4 the puppet model stores per bone: **row-major with the
+    /// translation in the last row** (a row-vector matrix, `v' = v * M`).
+    ///
+    /// This crate is column-major / column-vector, and the transpose of a
+    /// row-vector matrix is exactly what flattening those rows in order gives,
+    /// so the elements copy straight across: `(row, col) -> m[col * 4 + row]`.
+    pub fn from_row_vector(m: &[[f32; 4]; 4]) -> Self {
+        Mat4([
+            m[0][0], m[0][1], m[0][2], m[0][3], //
+            m[1][0], m[1][1], m[1][2], m[1][3], //
+            m[2][0], m[2][1], m[2][2], m[2][3], //
+            m[3][0], m[3][1], m[3][2], m[3][3], //
+        ])
+    }
+
+    /// Inverse of an affine matrix: invert the linear part, rebase the
+    /// translation. Perspective is impossible here, so a 3x3 inverse suffices.
+    /// A singular matrix (a bone scaled to zero) yields the identity rather than
+    /// producing a NaN pose.
+    pub fn inverse_affine(&self) -> Mat4 {
+        let m = &self.0;
+        // Column-major storage: element (row, col) is m[col * 4 + row].
+        let a = [
+            [m[0], m[4], m[8]],
+            [m[1], m[5], m[9]],
+            [m[2], m[6], m[10]],
+        ];
+        let t = [m[12], m[13], m[14]];
+        let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        if det.abs() < 1e-12 {
+            return Self::identity();
+        }
+        let d = 1.0 / det;
+        // Inverse = adjugate / det, where the adjugate is the transposed
+        // cofactor matrix.
+        let inv = [
+            [
+                (a[1][1] * a[2][2] - a[1][2] * a[2][1]) * d,
+                (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * d,
+                (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * d,
+            ],
+            [
+                (a[1][2] * a[2][0] - a[1][0] * a[2][2]) * d,
+                (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * d,
+                (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * d,
+            ],
+            [
+                (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * d,
+                (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * d,
+                (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * d,
+            ],
+        ];
+        // new translation = -(inverse linear part) * t
+        let nt = [
+            -(inv[0][0] * t[0] + inv[0][1] * t[1] + inv[0][2] * t[2]),
+            -(inv[1][0] * t[0] + inv[1][1] * t[1] + inv[1][2] * t[2]),
+            -(inv[2][0] * t[0] + inv[2][1] * t[1] + inv[2][2] * t[2]),
+        ];
+        Mat4([
+            inv[0][0], inv[1][0], inv[2][0], 0.0, //
+            inv[0][1], inv[1][1], inv[2][1], 0.0, //
+            inv[0][2], inv[1][2], inv[2][2], 0.0, //
+            nt[0], nt[1], nt[2], 1.0, //
+        ])
+    }
+
+    /// Transform a 3D point by this matrix.
+    pub fn transform_point3(&self, p: [f32; 3]) -> [f32; 3] {
+        let m = &self.0;
+        [
+            m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
+            m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+            m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+        ]
+    }
 }
 
 /// A rendered 2D image layer.

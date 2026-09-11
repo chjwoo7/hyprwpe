@@ -9,9 +9,11 @@ pub mod scaling;
 pub mod scene_layer;
 pub mod scene_transform;
 pub mod shader_layer;
+pub mod skin;
 pub mod video_layer;
 
 pub use image_layer::{Target, WallpaperSpec, Wallpapers};
 pub use scaling::{place, Placement, Scaling};
 pub use scene_layer::ScenePlayer;
 pub use shader_layer::ShaderPlayer;
+pub use skin::{deform, Rig};

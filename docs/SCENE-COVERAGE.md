@@ -143,9 +143,26 @@ Verified across the whole corpus with
 1061 vertices / 1771 triangles / 33 bones / 12 animations, and the butterfly
 48 / 81 / 1 / 1.
 
-Still to come: the per-vertex **skin weights** (in the vertex record payload
-between position and UV) and the skinning that turns them plus the animation into
-a deformed mesh; until then a puppet renders as its static material texture.
+The per-vertex **skin weights** (two four-slot blocks just before the UV pair, the
+first holding raw `u32` bone indices and the second their weights) parse too, and
+**47/47 skinned files** satisfy both invariants: weights sum to 1.0 and every used
+index is below the bone count, with zero violations over ~40k vertices.
+
+**Skinning is implemented and validated** (`crates/render/src/skin.rs`). A bone's
+stored matrix is its *local* transform and an animation keyframe is the same local
+transform, so the per-bone skin is `animated_world * inverse(rest_world)` and each
+vertex is the weighted blend of its influences. Two facts were pinned from geometry
+rather than assumed: the matrices compose along the parent chain (composed, each
+vertex's dominant bone lands ~3x closer than if read as absolute), and frame 0 is
+*usually* the bind pose but not always (`Car_puppet` starts away from rest), so the
+pose always comes from the keyframes. Offline proof:
+`cargo run -p hyprwpe-render --example skinpreview -- --corpus <dir>` reports
+**46 skinned models, 0 failures** — every pose across every animation stays finite
+and bounded, and Akali's loop returns exactly to rest at `t = length / fps`.
+
+Still to come: drawing the deformed mesh in the scene renderer (the mesh path and
+GPU objects exist; wiring the puppet's texture and per-frame upload is the last
+step). Until then a puppet renders as its static material texture.
 
 **2. Particles.** 52/75 wallpapers. The largest single jump available.
 
