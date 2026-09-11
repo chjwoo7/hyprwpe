@@ -425,6 +425,13 @@ pub struct General {
     pub nearz: Option<f32>,
     #[serde(default, deserialize_with = "deserialize_opt_f32")]
     pub farz: Option<f32>,
+    /// The wallpaper's editable user properties, kept as raw JSON.
+    ///
+    /// Not typed here on purpose: `crate::properties` owns the (versioned)
+    /// interpretation, and keeping the raw value means an unrecognised
+    /// declaration survives being read.
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 /// The `general.orthogonalprojection` object from a scene's scenario.
@@ -647,9 +654,7 @@ impl Scene {
                     for (key, field) in fields {
                         if let Some(anim) = field.get("animation") {
                             if let Ok(parsed) =
-                                serde_json::from_value::<crate::animation::Animation>(
-                                    anim.clone(),
-                                )
+                                serde_json::from_value::<crate::animation::Animation>(anim.clone())
                             {
                                 map.insert(key.clone(), parsed);
                             }
@@ -752,7 +757,10 @@ mod tests {
         let bg = &scene.objects[0];
         assert_eq!(bg.name.as_deref(), Some("Background"));
         assert_eq!(bg.kind(), ObjectKind::Image);
-        assert_eq!(bg.image_path().as_deref(), Some("materials/background.json"));
+        assert_eq!(
+            bg.image_path().as_deref(),
+            Some("materials/background.json")
+        );
         assert_eq!(bg.origin(), [960.0, 540.0, 0.0]);
         assert_eq!(bg.scale(), [1.0, 1.0, 1.0]);
         assert!(bg.is_visible());

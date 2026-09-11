@@ -10,6 +10,7 @@ pub mod hyprland;
 pub mod mdlv;
 pub mod particle;
 pub mod pkg;
+pub mod properties;
 pub mod protocol;
 pub mod scene;
 pub mod settings;

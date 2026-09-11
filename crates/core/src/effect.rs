@@ -179,7 +179,7 @@ fn expand_inner(
             out.push('\n');
             continue;
         };
-        let rest = trimmed.trim_start_matches("#include").trim_start();
+        let rest = rest.trim_start();
         let Some(open) = rest.find(['"', '<']) else {
             out.push_str(line);
             out.push('\n');

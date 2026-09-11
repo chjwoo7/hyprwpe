@@ -480,18 +480,6 @@ fn parse_asset_texb(bytes: &[u8], format: TexFormat) -> Option<TexImage> {
     })
 }
 
-trait FormatFallback {
-    fn or_else<F: FnOnce() -> Self>(self, f: F) -> Self;
-}
-impl FormatFallback for TexFormat {
-    fn or_else<F: FnOnce() -> Self>(self, f: F) -> Self {
-        match self {
-            TexFormat::Unknown(_) => f(),
-            other => other,
-        }
-    }
-}
-
 /// Convert 16-bit RGB565 to 24-bit RGB888.
 fn decode_rgb565(c: u16) -> [u8; 3] {
     let r = (((c >> 11) & 0x1F) * 527 + 23) >> 6;
