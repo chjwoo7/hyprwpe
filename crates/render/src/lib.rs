@@ -1,7 +1,9 @@
 //! Wallpaper renderers. Every renderer here is first-party; hyprwpe ships no
 //! third-party wallpaper runtime.
 
+pub mod effect_pass;
 pub mod gl;
+pub mod headless;
 pub mod image_layer;
 pub mod mesh;
 pub mod mpv_dl;

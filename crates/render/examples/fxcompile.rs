@@ -16,213 +16,79 @@
 use glow::HasContext;
 use hyprwpe_core::assets::Resources;
 use hyprwpe_core::effect::{self, Stage};
+use hyprwpe_render::headless::Headless;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// `EGL_PLATFORM_SURFACELESS_MESA`. khronos-egl types `Enum` as `c_uint`, so the
-/// constant is passed directly rather than looked up.
-const EGL_PLATFORM_SURFACELESS_MESA: khronos_egl::Enum = 0x31DD;
-
-/// The renderer loads EGL 1.4, which has no platform-display entry point. The
-/// surfaceless platform comes from `EGL_EXT_platform_base`, so this harness
-/// resolves `eglGetPlatformDisplayEXT` itself - the core 1.5
-/// `eglGetPlatformDisplay` is not exported by every driver's `libEGL` (it
-/// answers `EGL_BAD_PARAMETER` on glvnd here, while the `EXT` entry point
-/// works), which is exactly the kind of difference this harness exists to
-/// surface.
-type Egl = khronos_egl::DynamicInstance<khronos_egl::EGL1_4>;
-
-/// `eglGetPlatformDisplayEXT`
-type GetPlatformDisplayExt =
-    unsafe extern "system" fn(u32, *mut std::ffi::c_void, *const i32) -> *mut std::ffi::c_void;
-
-struct Gl {
-    /// Kept for the teardown in `Drop`; the instance itself is shared.
-    egl: std::sync::Arc<Egl>,
-    display: khronos_egl::Display,
-    context: khronos_egl::Context,
-    gl: glow::Context,
+/// Compile one stage, returning the driver's log on failure.
+fn compile(gl: &glow::Context, kind: u32, source: &str) -> Result<(), String> {
+    unsafe {
+        let shader = gl
+            .create_shader(kind)
+            .map_err(|e| format!("create_shader: {e}"))?;
+        gl.shader_source(shader, source);
+        gl.compile_shader(shader);
+        let ok = gl.get_shader_compile_status(shader);
+        let log = gl.get_shader_info_log(shader);
+        gl.delete_shader(shader);
+        if ok {
+            Ok(())
+        } else {
+            Err(log)
+        }
+    }
 }
 
-impl Gl {
-    /// A GLES 3 context with no window attached.
-    ///
-    /// Mesa advertises `EGL_KHR_surfaceless_context`, so `make_current` succeeds
-    /// with `NO_SURFACE` and everything drawn goes to framebuffers. If a driver
-    /// lacks it, a 1x1 pbuffer is created instead so the harness still runs.
-    fn surfaceless() -> anyhow::Result<Self> {
-        use khronos_egl as egl;
-        let egl = unsafe { Egl::load_required() }
-            .map_err(|e| anyhow::anyhow!("loading libEGL: {e:?}"))?;
-
-        let proc = egl
-            .get_proc_address("eglGetPlatformDisplayEXT")
-            .ok_or_else(|| anyhow::anyhow!("this libEGL has no eglGetPlatformDisplayEXT"))?;
-        let get_platform_display: GetPlatformDisplayExt = unsafe { std::mem::transmute(proc) };
-        let raw = unsafe {
-            get_platform_display(
-                EGL_PLATFORM_SURFACELESS_MESA,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if raw.is_null() {
-            let code = egl.get_error().map(|e| e as u32).unwrap_or(0);
-            anyhow::bail!("no surfaceless EGL display (EGL error {code:#x})");
-        }
-        let display = unsafe { egl::Display::from_ptr(raw) };
-        egl.initialize(display)
-            .map_err(|e| anyhow::anyhow!("initialising EGL: {e:?}"))?;
-        egl.bind_api(egl::OPENGL_ES_API)
-            .map_err(|e| anyhow::anyhow!("binding ES API: {e:?}"))?;
-
-        let config_attributes = [
-            egl::SURFACE_TYPE,
-            egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES3_BIT,
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::NONE,
-        ];
-        let config = egl
-            .choose_first_config(display, &config_attributes)
-            .map_err(|e| anyhow::anyhow!("choosing a config: {e:?}"))?
-            .ok_or_else(|| anyhow::anyhow!("no GLES 3 config available"))?;
-
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE];
-        let context = egl
-            .create_context(display, config, None, &context_attributes)
-            .map_err(|e| anyhow::anyhow!("creating a GLES 3 context: {e:?}"))?;
-
-        // Surfaceless first; a pbuffer is the fallback for drivers without it.
-        if egl
-            .make_current(display, None, None, Some(context))
-            .is_err()
-        {
-            let pbuffer = egl
-                .create_pbuffer_surface(
-                    display,
-                    config,
-                    &[egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE],
-                )
-                .map_err(|e| anyhow::anyhow!("no surfaceless context and no pbuffer: {e:?}"))?;
-            egl.make_current(display, Some(pbuffer), Some(pbuffer), Some(context))
-                .map_err(|e| anyhow::anyhow!("making the pbuffer current: {e:?}"))?;
-        }
-
-        let gl = unsafe {
-            glow::Context::from_loader_function(|name| {
-                egl.get_proc_address(name)
-                    .map(|p| p as *const std::ffi::c_void)
-                    .unwrap_or(std::ptr::null())
-            })
-        };
-        Ok(Gl {
-            egl: egl.into(),
-            display,
-            context,
-            gl,
-        })
-    }
-
-    fn version(&self) -> String {
-        unsafe {
-            format!(
-                "{} | {}",
-                self.gl.get_parameter_string(glow::VERSION),
-                self.gl.get_parameter_string(glow::SHADING_LANGUAGE_VERSION)
-            )
-        }
-    }
-
-    /// Compile both stages of a pass and link them into a program.
-    ///
-    /// Compiling is only half of what a render pass needs. Linking the stages
-    /// together is what catches an interface the vertex and fragment shaders
-    /// disagree about - a `varying` never written, a mismatched type - which no
-    /// single-stage compile can see.
-    fn link(&self, vert: &str, frag: &str) -> Result<(), String> {
-        unsafe {
-            let mut shaders = Vec::new();
-            for (kind, src, label) in [
-                (glow::VERTEX_SHADER, vert, "vertex"),
-                (glow::FRAGMENT_SHADER, frag, "fragment"),
-            ] {
-                let sh = self
-                    .gl
-                    .create_shader(kind)
-                    .map_err(|e| format!("create_shader({label}): {e}"))?;
-                self.gl.shader_source(sh, src);
-                self.gl.compile_shader(sh);
-                if !self.gl.get_shader_compile_status(sh) {
-                    let log = self.gl.get_shader_info_log(sh);
-                    for s in &shaders {
-                        self.gl.delete_shader(*s);
-                    }
-                    self.gl.delete_shader(sh);
-                    return Err(format!("{label}: {}", log.trim()));
-                }
-                shaders.push(sh);
-            }
-            let program = self
-                .gl
-                .create_program()
-                .map_err(|e| format!("create_program: {e}"))?;
-            for sh in &shaders {
-                self.gl.attach_shader(program, *sh);
-            }
-            // Our fragment output is a declared `out`, and its name is only
-            // meaningful if the binding is explicit.
-            self.gl.bind_frag_data_location(program, 0, "wp_FragColor");
-            self.gl.link_program(program);
-            let ok = self.gl.get_program_link_status(program);
-            let log = self.gl.get_program_info_log(program);
-            for sh in &shaders {
-                self.gl.detach_shader(program, *sh);
-                self.gl.delete_shader(*sh);
-            }
-            self.gl.delete_program(program);
-            if ok {
-                Ok(())
-            } else {
-                Err(format!("link: {}", log.trim()))
-            }
-        }
-    }
-
-    /// Compile one stage, returning the driver's log on failure.
-    fn compile(&self, kind: u32, source: &str) -> Result<(), String> {
-        unsafe {
-            let shader = self
-                .gl
+/// Compile both stages of a pass and link them into a program.
+///
+/// Compiling is only half of what a render pass needs. Linking the stages
+/// together is what catches an interface the vertex and fragment shaders
+/// disagree about - a `varying` never written, a mismatched type - which no
+/// single-stage compile can see.
+fn link(gl: &glow::Context, vert: &str, frag: &str) -> Result<(), String> {
+    unsafe {
+        let mut shaders = Vec::new();
+        for (kind, src, label) in [
+            (glow::VERTEX_SHADER, vert, "vertex"),
+            (glow::FRAGMENT_SHADER, frag, "fragment"),
+        ] {
+            let sh = gl
                 .create_shader(kind)
-                .map_err(|e| format!("create_shader: {e}"))?;
-            self.gl.shader_source(shader, source);
-            self.gl.compile_shader(shader);
-            let ok = self.gl.get_shader_compile_status(shader);
-            let log = self.gl.get_shader_info_log(shader);
-            self.gl.delete_shader(shader);
-            if ok {
-                Ok(())
-            } else {
-                Err(log)
+                .map_err(|e| format!("create_shader({label}): {e}"))?;
+            gl.shader_source(sh, src);
+            gl.compile_shader(sh);
+            if !gl.get_shader_compile_status(sh) {
+                let log = gl.get_shader_info_log(sh);
+                for s in &shaders {
+                    gl.delete_shader(*s);
+                }
+                gl.delete_shader(sh);
+                return Err(format!("{label}: {}", log.trim()));
             }
+            shaders.push(sh);
         }
-    }
-}
-
-impl Drop for Gl {
-    fn drop(&mut self) {
-        let _ = self.egl.make_current(self.display, None, None, None);
-        let _ = self.egl.destroy_context(self.display, self.context);
-        let _ = self.egl.terminate(self.display);
+        let program = gl
+            .create_program()
+            .map_err(|e| format!("create_program: {e}"))?;
+        for sh in &shaders {
+            gl.attach_shader(program, *sh);
+        }
+        gl.bind_attrib_location(program, 0, "a_Position");
+        gl.bind_attrib_location(program, 1, "a_TexCoord");
+        gl.bind_frag_data_location(program, 0, "wp_FragColor");
+        gl.link_program(program);
+        let ok = gl.get_program_link_status(program);
+        let log = gl.get_program_info_log(program);
+        for sh in &shaders {
+            gl.detach_shader(program, *sh);
+            gl.delete_shader(*sh);
+        }
+        gl.delete_program(program);
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("link: {}", log.trim()))
+        }
     }
 }
 
@@ -233,15 +99,15 @@ fn main() {
         .unwrap_or_else(|| "~/.steam/root/steamapps/workshop/content/431960".into());
     let root = PathBuf::from(expand(&root));
 
-    let gl = match Gl::surfaceless() {
-        Ok(gl) => gl,
+    let ctx = match Headless::new() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("no headless GL context: {e:#}");
-            eprintln!("(this harness needs EGL with the surfaceless platform)");
             std::process::exit(2);
         }
     };
-    println!("GL context: {}", gl.version());
+    let gl = &ctx.gl;
+    println!("GL context: {}", ctx.version());
 
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
         .expect("read workshop dir")
@@ -335,7 +201,7 @@ fn main() {
                             } else {
                                 glow::VERTEX_SHADER
                             };
-                            match gl.compile(kind, &assembled) {
+                            match compile(gl, kind, &assembled) {
                                 Ok(()) => {
                                     stages_ok += 1;
                                     built.push((stage, assembled));
@@ -368,7 +234,7 @@ fn main() {
                             .map(|(_, src)| src.clone());
                         if let (Some(frag), Some(vert)) = (frag, vert) {
                             programs_attempted += 1;
-                            if let Err(e) = gl.link(&vert, &frag) {
+                            if let Err(e) = link(gl, &vert, &frag) {
                                 programs_failed += 1;
                                 first_error = Some(format!("shaders/{}: {e}", pass.shader));
                                 break 'mat;

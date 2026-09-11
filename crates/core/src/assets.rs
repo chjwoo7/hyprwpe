@@ -139,6 +139,22 @@ impl Resources {
         Some(String::from_utf8_lossy(&self.get(name)?).into_owned())
     }
 
+    /// Read an entry from the **package only**, ignoring the engine's assets.
+    ///
+    /// Needed wherever "is this the wallpaper's own file?" matters: picking a
+    /// package that carries a given effect, or telling a creator's override from
+    /// an engine built-in. `get` deliberately falls through to the assets, so a
+    /// name that exists in both resolves to the same bytes either way - but which
+    /// *source* it came from is a different question, and only this answers it.
+    pub fn get_from_package(&self, name: &str) -> Option<Vec<u8>> {
+        self.package.get(name).map(|b| b.to_vec())
+    }
+
+    /// Whether the package itself carries an entry.
+    pub fn package_has(&self, name: &str) -> bool {
+        self.package.get(name).is_some()
+    }
+
     /// Read a `.tex` together with its `.tex-json` sidecar.
     ///
     /// The engine's asset textures state their pixel format in the sidecar, so a
@@ -166,6 +182,49 @@ impl Resources {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Which *source* an entry came from is a different question from whether it
+    /// resolves at all, and picking a package for an effect needs the former.
+    #[test]
+    fn the_package_source_is_distinguishable_from_the_engine_assets() {
+        let dir = std::env::temp_dir().join(format!("hyprwpe-assets-src-{}", std::process::id()));
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("builtin.h"), b"from the engine").unwrap();
+
+        let pkg_path = dir.join("p.pkg");
+        std::fs::write(&pkg_path, {
+            // One entry, `packaged.h`.
+            let name = b"packaged.h";
+            let body = b"from the package";
+            let mut b = Vec::new();
+            let version = b"PKGV0001";
+            b.extend_from_slice(&(version.len() as u32).to_le_bytes());
+            b.extend_from_slice(version);
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name);
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            b.extend_from_slice(body);
+            b
+        })
+        .unwrap();
+
+        let res = Resources::with_assets(&pkg_path, Some(assets.clone())).unwrap();
+        // `get` falls through to the assets, so both resolve.
+        assert!(res.get_str("packaged.h").is_some());
+        assert!(res.get_str("builtin.h").is_some());
+        // The package-only view tells them apart.
+        assert!(res.package_has("packaged.h"));
+        assert!(!res.package_has("builtin.h"));
+        assert_eq!(
+            res.get_from_package("packaged.h").as_deref(),
+            Some(&b"from the package"[..])
+        );
+        assert!(res.get_from_package("builtin.h").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_name_with_a_parent_escape_is_refused() {
