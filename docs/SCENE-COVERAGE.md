@@ -160,9 +160,11 @@ pose always comes from the keyframes. Offline proof:
 **46 skinned models, 0 failures** — every pose across every animation stays finite
 and bounded, and Akali's loop returns exactly to rest at `t = length / fps`.
 
-Still to come: drawing the deformed mesh in the scene renderer (the mesh path and
-GPU objects exist; wiring the puppet's texture and per-frame upload is the last
-step). Until then a puppet renders as its static material texture.
+The mesh is drawn in the scene renderer (`MeshRenderer` + per-frame CPU skinning,
+`scene_layer::PuppetLayer`), with the model's `cropoffset` honoured; verified live
+on both outputs and offline by the software rasteriser in `scenecompose`. Still to
+come: attachments (`MDAT`), the texture-channel / blend-rule tracks (parsed but not
+applied), particle objects, and the effect pipeline.
 
 **2. Particles.** 52/75 wallpapers. The largest single jump available.
 

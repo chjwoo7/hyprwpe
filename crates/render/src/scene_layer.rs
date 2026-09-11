@@ -12,11 +12,14 @@ use hyprwpe_core::tex::TexImage;
 use std::path::Path;
 
 use crate::scaling::Scaling;
+use crate::mesh::MeshRenderer;
 use crate::scene_transform::{
-    animated_alpha, animated_world_transforms, canvas_map, clear_color, view_window,
-    world_transforms, Affine,
+    animated_alpha, animated_world_transforms, canvas_map, clear_color, puppet_placement,
+    view_window, world_transforms, Affine,
 };
+use crate::skin::{deform, Rig};
 use hyprwpe_core::animation::Animation;
+use hyprwpe_core::mdlv;
 use hyprwpe_core::scene::SceneObject;
 use std::collections::HashMap;
 
@@ -255,6 +258,28 @@ impl Mat4 {
     }
 }
 
+/// A puppet object: a skinned mesh drawn with its material texture.
+///
+/// The mesh is uploaded once in its rest pose; each frame the pose for the
+/// current time is sampled, the vertices are deformed on the CPU, and only the
+/// positions are re-uploaded.
+struct PuppetLayer {
+    mesh: MeshRenderer,
+    texture: glow::Texture,
+    rig: Rig,
+    model: mdlv::PuppetModel,
+    /// Index into the scene's object list, for the animated transform and alpha.
+    object_index: usize,
+    /// Which of the model's animations to play; the first is the editor default.
+    animation: usize,
+    /// Model coordinates -> design units (object transform + `cropoffset`).
+    placement: Affine,
+    color: [f32; 3],
+    visible: bool,
+    /// Reused deformation buffer, so a frame allocates nothing.
+    positions: Vec<[f32; 2]>,
+}
+
 /// A rendered 2D image layer.
 pub struct RenderLayer {
     pub texture: glow::Texture,
@@ -282,6 +307,8 @@ pub struct ScenePlayer {
     loc_model: Option<glow::UniformLocation>,
     loc_color: Option<glow::UniformLocation>,
     layers: Vec<RenderLayer>,
+    /// Puppet objects (skinned meshes) in scene order after the quads.
+    puppets: Vec<PuppetLayer>,
     /// Scene space the projection maps to the surface. `None` means "use the
     /// surface size" (the scene does not declare an orthogonal canvas).
     design: Option<(f32, f32)>,
@@ -380,6 +407,7 @@ impl ScenePlayer {
 
             let world = world_transforms(&scene.objects);
             let mut layers = Vec::new();
+            let mut puppets = Vec::new();
 
             for (i, obj) in scene.objects.iter().enumerate() {
                 if obj.kind() != ObjectKind::Image {
@@ -388,6 +416,45 @@ impl ScenePlayer {
                 let Some(mat_path) = obj.image_path() else {
                     continue;
                 };
+
+                // A model naming a `puppet` is a deforming mesh: parse it, build
+                // the rig, and draw triangles instead of a textured quad.
+                if let Some(mdl_path) = resolve_puppet_file(&pkg, &mat_path) {
+                    if let (Some(raw), Some((tex_handle, _, _))) = (
+                        pkg.get(&mdl_path),
+                        resolve_texture_file(&pkg, &mat_path)
+                            .and_then(|name| load_texture_from_pkg(&pkg, &name, gl)),
+                    ) {
+                        if let Ok(model) = mdlv::parse(raw) {
+                            let mut mesh = match MeshRenderer::new(gl) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let rest: Vec<[f32; 2]> =
+                                model.mesh.positions.iter().map(|p| [p[0], p[1]]).collect();
+                            if mesh.upload(gl, &rest, &model.mesh.uvs, &model.mesh.indices).is_ok() {
+                                let color_rgb = obj
+                                    .color
+                                    .map(|c| [c.x(), c.y(), c.z()])
+                                    .unwrap_or([1.0, 1.0, 1.0]);
+                                let crop = model_cropoffset(&pkg, &mat_path);
+                                puppets.push(PuppetLayer {
+                                    mesh,
+                                    texture: tex_handle,
+                                    rig: Rig::new(&model),
+                                    model,
+                                    object_index: i,
+                                    animation: 0,
+                                    placement: puppet_placement(&world[i], crop),
+                                    color: color_rgb,
+                                    visible: obj.is_visible(),
+                                    positions: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 let texture_file = resolve_texture_file(&pkg, &mat_path);
                 let Some(tex_name) = texture_file else {
@@ -432,6 +499,7 @@ impl ScenePlayer {
                 loc_model,
                 loc_color,
                 layers,
+                puppets,
                 design,
                 zoom,
                 scaling,
@@ -557,6 +625,39 @@ impl ScenePlayer {
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
 
+            // Puppets (skinned meshes). The pose is sampled for this instant, the
+            // vertices are deformed on the CPU, and only the positions are
+            // re-uploaded before drawing — the rest of the vertex data is static.
+            for p in &mut self.puppets {
+                if !p.visible {
+                    continue;
+                }
+                let anim = p.model.animations.get(p.animation);
+                let pose = p.rig.pose(anim, t);
+                deform(&p.model.mesh, &pose, &mut p.positions);
+                if p.positions.len() != p.model.mesh.positions.len() {
+                    continue;
+                }
+                p.mesh.update_positions(gl, &p.positions);
+                let alpha = if self.animated {
+                    animated_alpha(
+                        &self.objects[p.object_index],
+                        &self.animations[p.object_index],
+                        t,
+                    )
+                } else {
+                    self.objects[p.object_index].alpha()
+                };
+                let model = Mat4::from_affine(&p.placement);
+                p.mesh.draw(
+                    gl,
+                    &proj,
+                    &model,
+                    p.texture,
+                    [p.color[0], p.color[1], p.color[2], alpha],
+                );
+            }
+
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
             gl.use_program(None);
@@ -571,6 +672,10 @@ impl ScenePlayer {
         unsafe {
             for layer in self.layers {
                 gl.delete_texture(layer.texture);
+            }
+            for p in self.puppets {
+                gl.delete_texture(p.texture);
+                p.mesh.destroy(gl);
             }
             gl.delete_program(self.program);
             gl.delete_vertex_array(self.vao);
@@ -654,6 +759,26 @@ fn is_image_file(path: &str) -> bool {
         || lower.ends_with(".jpeg")
         || lower.ends_with(".tga")
         || lower.ends_with(".bmp")
+}
+
+/// The `cropoffset` a model JSON may carry, in model space.
+///
+/// It shifts the mesh before the object transform, and is the only model-space
+/// adjustment a puppet needs.
+fn model_cropoffset(pkg: &Package, image_ref: &str) -> [f32; 2] {
+    let Some(body) = pkg.get_str(image_ref) else {
+        return [0.0, 0.0];
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return [0.0, 0.0];
+    };
+    let Some(s) = v.get("cropoffset").and_then(|c| c.as_str()) else {
+        return [0.0, 0.0];
+    };
+    let mut it = s.split_whitespace().filter_map(|t| t.parse::<f32>().ok());
+    let x = it.next().unwrap_or(0.0);
+    let y = it.next().unwrap_or(0.0);
+    [x, y]
 }
 
 /// If the object's image resolves through a model JSON that names a puppet

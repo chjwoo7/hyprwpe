@@ -129,6 +129,19 @@ impl Affine {
     }
 }
 
+/// Placement of a puppet mesh in design space.
+///
+/// A puppet's mesh is authored in the model's own coordinates, which the object
+/// transform places exactly like any other layer; the model may additionally
+/// carry a `cropoffset`, applied first, in model space. There is no half-extent
+/// fold here: the mesh carries absolute coordinates, unlike the `-1..1` quad.
+///
+/// The GL renderer and the `scenecompose` harness both call this, so a framing
+/// bug shows up the same way in each.
+pub fn puppet_placement(world: &Affine, crop: [f32; 2]) -> Affine {
+    world.mul(&Affine::translate(crop[0], crop[1]))
+}
+
 /// The object's own transform: `translate(origin) * rotate(angles.z) * scale(scale)`.
 pub fn local_transform(obj: &SceneObject) -> Affine {
     let origin = obj.origin();
