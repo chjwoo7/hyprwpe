@@ -287,9 +287,32 @@ off-screen, run the passes with framebuffer ping-pong, then draw the result.
 Only the single effect that also fails to compile does not link.
 
 
-What remains for pixels is the GL side: a framebuffer ping-pong that runs each
-object's effect passes in order, with the constants resolved from the scene and
-the object's own `constantshadervalues`.
+The GL side runs too. `crates/render/src/effect_pass.rs` applies a chain as a
+framebuffer ping-pong - a fullscreen quad per pass, reading the previous result -
+with the values resolved in the engine's own order: the scene object's
+`effects[].passes[].constantshadervalues`, then the material's, then the
+`default` in the uniform's JSON comment. `RenderLayer` carries the chains, so an
+object that stacks several effects gets them applied in order.
+
+`cargo run -p hyprwpe-render --example scenerender -- <scene.pkg> out.png 1920 1080 fill`
+renders a wallpaper through `ScenePlayer` on the surfaceless context and reports
+coverage, mean colour and alpha, so the whole path is checkable without a
+monitor; `--no-effects` and `--set key=value` make it a measurement rather than a
+screenshot. On a real wallpaper (`1906757512`, `tint` as its final pass):
+
+| run | covered | mean rgb |
+| --- | --- | --- |
+| default | 100.00% | 255.0, 248.0, 30.0 |
+| `--set color=1 0 0` | 100.00% | 255.0, 0.0, 0.0 |
+| `--no-effects` | 30.12% | 174.7, 177.7, 177.4 |
+
+Two bugs came out of it, both invisible to the isolated pass test: uniforms were
+being written **without binding the program** (a `glUniform*` call goes to the
+currently bound program, so every value silently stayed at its default), and an
+effect pass **leaves no VAO bound**, which made every later draw - the layer
+composite, every puppet, every particle - render nothing and left the frame one
+flat colour. The renderer now restores program, VAO, blending and depth state
+after a chain.
 
 **4. Text (18/75) and sound (41/75).** Sound is common but not visual — silence
 is a much smaller defect than a missing layer, so it ranks below anything that
