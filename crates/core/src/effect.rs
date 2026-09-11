@@ -233,9 +233,26 @@ fn expand_inner(
 /// select a combo must still define it. `0` is the honest default: it is what
 /// "this option is off" means, and the shader's own `#else` branch then applies.
 pub fn combo_defines(source: &str) -> Vec<String> {
+    // A name the source itself `#define`s is a *macro*, not a combo, and
+    // defaulting it would poison the real definition: the engine's
+    // `common_fragment.h` defines `FORMAT_DXT1 7`, so emitting `#define
+    // FORMAT_DXT1 0` first made the header a redefinition. Anything the body
+    // defines is therefore excluded.
+    let defined: std::collections::HashSet<&str> = source
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            let rest = t.strip_prefix('#')?.trim_start().strip_prefix("define")?;
+            rest.starts_with([' ', '\t'])
+                .then(|| rest.split_whitespace().next())
+                .flatten()
+        })
+        .collect();
+
     let mut names: Vec<String> = uniform_bindings(source)
         .into_iter()
         .filter_map(|u| u.combo)
+        .filter(|c| !defined.contains(c.as_str()))
         .collect();
     // Also catch combos referenced in `#if` but not declared by a uniform: some
     // effects branch on a name the material sets instead.
@@ -260,6 +277,7 @@ pub fn combo_defines(source: &str) -> Vec<String> {
             names.push(token.to_string());
         }
     }
+    names.retain(|n| !defined.contains(n.as_str()));
     names.sort();
     names.dedup();
     names
@@ -334,6 +352,9 @@ pub fn assemble(source: &str, stage: Stage, defines: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     let body = strip_texture_uniforms(&body);
+    // The last step before the driver sees it: turn HLSL-isms into GLSL ES.
+    // Ordered after the uniform work so the transforms here see final text.
+    let body = crate::hlsl::normalise(&body);
 
     let mut out = String::with_capacity(body.len() + PRELUDE.len() + 512);
     out.push_str("#version 300 es\n");
@@ -488,6 +509,21 @@ uniform mat4 g_ModelViewProjectionMatrix;
         };
         // Each file is included once, so the cycle stops rather than recursing.
         assert!(expand_includes("#include \"a.h\"\n", &files).is_ok());
+    }
+
+    /// The bug that kept every `lightshafts`-family effect failing: a name the
+    /// source `#define`s is a macro, and defaulting it to 0 turns the engine's
+    /// own definition into a redefinition.
+    #[test]
+    fn a_name_the_source_defines_is_not_defaulted_as_a_combo() {
+        let src = "#include \"common_fragment.h\"\n#define FORMAT_DXT1 7\n#if TEX1FORMAT == FORMAT_DXT1\n#endif\n";
+        let defs = combo_defines(src);
+        assert!(
+            !defs.iter().any(|d| d.contains("FORMAT_DXT1")),
+            "a macro must not be defaulted: {defs:?}"
+        );
+        // The genuine combo in the same expression still gets a default.
+        assert!(defs.iter().any(|d| d.contains("TEX1FORMAT")), "{defs:?}");
     }
 
     #[test]

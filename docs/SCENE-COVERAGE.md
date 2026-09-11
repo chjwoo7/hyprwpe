@@ -220,40 +220,63 @@ gated the entire library: includes resolve both bare and under `shaders/` (the
 engine keeps `common*.h` there and every effect includes at least one), and
 `usershadervalues` binds a uniform to a user property.
 
-Assembling a source is not compiling it, and the difference turned out to matter.
+Assembling a source is not compiling it, and the difference matters.
 `cargo run -p hyprwpe-render --example fxcompile` gets a real GLES 3 context
 through **surfaceless EGL** — no window, no compositor, nothing on the user's
-screen — and compiles every stage:
+screen — and compiles every stage of every effect in the library. The driver's
+own log is the only thing that can tell you whether shader *source* is real
+GLSL, and it found bugs no string-level check could see.
 
-| | |
-| --- | --- |
-| shader stages compiled | **1338** |
-| shader stages rejected | 56 |
-| effects compiling completely | **35 of 91** |
+Before the translation layer existed, **0 stages compiled**. Now:
 
-The driver's own log found four bugs in the assembler that string-level
-validation could never see, each now fixed and covered by a test:
+| | before | after |
+| --- | --- | --- |
+| shader stages compiling | 0 | **2216** |
+| effects compiling completely | 0 of 91 | **69 of 91** |
 
-- The prelude **redefined `hsv2rgb`, `rgb2hsv`, `rotateVec2` and `greyscale`**,
-  which the engine's own `common.h` defines as functions —
-  `error C1013: function "hsv2rgb" is already defined`. The prelude is now
-  macros only, `#ifndef`-guarded, and those four live solely in `common.h`.
-- `frac(...)` is HLSL; GLSL ES has `fract`.
-- A shader's combo guards (`#if KERNEL == 0`) were undefined, and GLSL ES rejects
-  an `#if` over an undefined name where HLSL read it as 0 — so combo names are
-  now defaulted to 0, which is what "option off" means.
-- `CASTn` is a **broadcast** (`CAST2(1.409)` in a `vec2` expression), not an
-  identity, and needs integer as well as float overloads; and a shader's
-  `#include`d helper can *use* `g_Texture0` before the shader declares it, so the
-  host injects the sampler set ahead of the body and drops the shader's own
-  duplicate declaration (a duplicate uniform is itself an error).
+Getting there needed `crates/core/src/hlsl.rs`, a narrow HLSL→GLSL layer, because
+the scene shaders are written in HLSL-flavoured GLSL and the engine's compiler
+was lenient where GLSL ES is not. Every rule in it was forced by a measured
+failure, not guessed:
 
-What is left is one honest class: **HLSL's implicit int↔float promotion** (62 of
-the remaining errors, e.g. `implicit cast from "int" to "float"`), plus a handful
-of `sample`-as-an-identifier collisions and `max(int, vec3)`. Those need a real
-HLSL→GLSL typing pass, not more string shims; until it exists 56 effects are
-reported as unsupported rather than rendered wrongly, which is what the honesty
-rule below requires.
+- **Integer literals in float positions** — `3 * amt`, `pointer * 2 - 1`,
+  `max(0, colour)`, `smoothstep(1 - g_Rough, 1, t)`. The largest class by far.
+  Promotion is suppressed where an integer is *required*: inside a subscript,
+  on a preprocessor line, and anywhere in a statement that declares an `int`
+  (so `for (int i = 0; i < 10; i++)` is left intact).
+- **`sample` as an identifier** — reserved in GLSL ES 3.0, used as a local by
+  several effects.
+- **`fmod`** — HLSL's name; GLSL has `mod`.
+- **A macro defined twice** — two of the engine's headers define the `FORMAT_*`
+  constants, and GLSL rejects *any* redefinition, so the repeat is guarded.
+- **A uniform the material marks `"int": true`** while the shader declares it
+  `float`, which is what makes `for (int i = u_Min; i < u_Max; i++)` legal.
+- **The prelude itself was wrong four times.** The driver caught what no amount
+  of reading could: it redefined `hsv2rgb`, `rgb2hsv`, `rotateVec2` and
+  `greyscale`, which the engine's own `common.h` defines as functions
+  ("function is already defined"); `frac` is HLSL; combo guards (`#if KERNEL ==
+  0`) named undefined macros, and GLSL ES rejects an `#if` over an undefined
+  name where HLSL read it as 0; and `CASTn` is a *broadcast* needing int and
+  float overloads, while a shader's `#include`d helper can *use* `g_Texture0`
+  before the shader declares it (the host now injects the sampler set ahead of
+  the body and drops the shader's own duplicate, since a duplicate uniform is
+  itself an error).
+
+One bug is worth recording because it was self-inflicted and subtle: defaulting
+every identifier in a `#if` to `0` also defaulted `FORMAT_DXT1`, *poisoning the
+header's own definition* into a redefinition and failing every effect in the
+`lightshafts` family. A name the source `#define`s is a macro, not a combo.
+
+**What is left is 22 effects**, and they need a real answer rather than more
+string shims: HLSL's implicit int↔float and int↔uint conversion on *variables*
+(`sampleCount - 1.0`, `i / sampleDrop`, `RESOLUTION` used as a float), vec4→vec2
+implicit truncation on assignment, and scalar↔vector broadcasting in builtins
+(`max(0.0, albedo.rgb)`). Those are a typing pass, and until it exists those
+effects are reported as unsupported rather than rendered wrongly — which is what
+the honesty rule below requires. A handful of workshop effects also reference
+engine-provided uniforms (`g_AudioSpectrum*`) that the engine injects but never
+ships in `assets/shaders/`; their array sizes are not guessable, so they are not
+being invented.
 
 What remains for pixels is the GL side: a framebuffer ping-pong that runs each
 object's effect passes in order, with the constants resolved from the scene and

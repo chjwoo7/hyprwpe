@@ -67,9 +67,8 @@ impl Gl {
             )
         };
         if raw.is_null() {
-            anyhow::bail!("no surfaceless EGL display (EGL error {:#x})", unsafe {
-                egl.get_error().map(|e| e as u32).unwrap_or(0)
-            });
+            let code = egl.get_error().map(|e| e as u32).unwrap_or(0);
+            anyhow::bail!("no surfaceless EGL display (EGL error {code:#x})");
         }
         let display = unsafe { egl::Display::from_ptr(raw) };
         egl.initialize(display)
@@ -283,13 +282,34 @@ fn main() {
                                         let _ = std::fs::write(&out, &assembled);
                                         eprintln!("dumped {out}");
                                     }
-                                    let first = log
-                                        .lines()
-                                        .find(|l| l.contains("ERROR"))
-                                        .unwrap_or(log.trim())
-                                        .trim()
-                                        .to_string();
-                                    first_error = Some(format!("{path}: {first}"));
+                                    let src_lines: Vec<&str> = assembled.lines().collect();
+                                    let mut detail = String::new();
+                                    for l in log.lines() {
+                                        let l = l.trim();
+                                        if !l.contains("error") {
+                                            continue;
+                                        }
+                                        detail.push_str(&format!("\n    {l}"));
+                                        if let Some(rest) = l.strip_prefix("0(") {
+                                            if let Some(close) = rest.find(')') {
+                                                if let Ok(n) = rest[..close].trim().parse::<usize>()
+                                                {
+                                                    if let Some(src) =
+                                                        src_lines.get(n.saturating_sub(1))
+                                                    {
+                                                        detail.push_str(&format!(
+                                                            "\n      > {}",
+                                                            src.trim()
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if detail.lines().count() >= 12 {
+                                            break;
+                                        }
+                                    }
+                                    first_error = Some(format!("{path}:{detail}"));
                                     break 'mat;
                                 }
                             }

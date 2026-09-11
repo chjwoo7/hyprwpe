@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod effect;
+pub mod hlsl;
 pub mod hyprland;
 pub mod mdlv;
 pub mod particle;
