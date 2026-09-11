@@ -113,18 +113,77 @@ Check daemon liveness without side effects.
 
 ---
 
+### 7. `properties`
+The settings a wallpaper exposes, with the user's saved values applied. This is
+everything a settings panel needs to render itself: the key, the type, the
+current value, a slider's range, a combo's options and the human label.
+
+```json
+{
+  "command": "properties",
+  "path": "/home/me/.steam/steamapps/workshop/content/431960/2387296214/scene.pkg"
+}
+```
+
+---
+
+### 8. `set_property`
+Change one setting and re-apply the wallpaper live. The value is validated
+against the wallpaper's own declaration — a `99` on a `0..1` slider is stored as
+`1`, and a value that cannot be represented at all is an error rather than a
+silent no-op. The change is persisted, so it survives a restart, and the scene is
+rebuilt so the effect is visible without a second `set`.
+
+```json
+{
+  "command": "set_property",
+  "path": "/home/me/.steam/steamapps/workshop/content/431960/2387296214/scene.pkg",
+  "key": "crtfilter",
+  "value": false
+}
+```
+
+---
+
 ## Responses
 
 All responses contain a `"result"` discriminator field.
 
 ### 1. `ok`
-Returned when a `set`, `pause`, `resume`, `stop`, or `ping` command succeeds.
+Returned when a `set`, `set_property`, `pause`, `resume`, `stop`, or `ping`
+command succeeds. `set_property` reports the value that was actually stored, so a
+caller is never left believing a clamped value was applied verbatim.
 
 ```json
 {
   "result": "ok"
 }
 ```
+
+### 1b. `properties`
+
+```json
+{
+  "result": "properties",
+  "script_bindings": 3,
+  "properties": [
+    {
+      "key": "crtfilter",
+      "kind": "bool",
+      "value": true,
+      "text": "CRT Filter",
+      "order": 106,
+      "index": 6,
+      "range": null,
+      "options": []
+    }
+  ]
+}
+```
+
+`script_bindings` counts the scene fields driven by SceneScript. hyprwpe does not
+run JavaScript, so a panel is expected to say that changing those settings has no
+visible effect rather than leaving the user to discover it.
 
 ### 2. `status`
 Returned in response to the `status` command.

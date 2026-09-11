@@ -163,19 +163,118 @@ and bounded, and Akali's loop returns exactly to rest at `t = length / fps`.
 The mesh is drawn in the scene renderer (`MeshRenderer` + per-frame CPU skinning,
 `scene_layer::PuppetLayer`), with the model's `cropoffset` honoured; verified live
 on both outputs and offline by the software rasteriser in `scenecompose`. Still to
-come: attachments (`MDAT`), the texture-channel / blend-rule tracks (parsed but not
-applied), particle objects, and the effect pipeline.
+come: attachments (`MDAT`) and the texture-channel / blend-rule tracks (both parsed
+but not applied).
 
-**2. Particles.** 52/75 wallpapers. The largest single jump available.
+**2. Particles.** 52/75 wallpapers. The largest single jump available — and
+implemented.
+
+Particle definitions are **declarative data, not code**: an object names a
+`particle` file whose `emitters`, `initializers`, `operators` and `renderers`
+configure a closed vocabulary (2 emitter kinds, 10 initializers, 12 operators,
+4 renderers across the corpus), with parameters looked up **by name** rather than
+by offset, so a version that adds a parameter degrades to ignoring it. Because
+every scene is therefore a combination of the same primitives, one simulator
+serves all of them: `crates/render/src/particle.rs` runs it on the CPU with a
+deterministic RNG, so a frame at a given time is reproducible and testable
+without a GPU.
+
+Two real bugs came out of building it: `alphafade` was compounding per frame
+(multiplying alpha every step, so sprites vanished) — state is now derived from
+an `alpha_base` each frame; and a long stall (a paused daemon) must not spawn a
+burst, so a frame's `dt` is clamped.
+
+Particles need the engine's own assets, which the user's Wallpaper Engine
+installation already provides: **22/130 particle textures ship inside the
+wallpaper package, the other 108 reference `materials/particle/*` in the engine's
+`assets/` directory** (shaders, particle textures and fonts all live there).
+`crates/core/src/assets.rs` resolves a name package-first then engine-assets, so
+nothing is redistributed and a machine without Wallpaper Engine installed simply
+loses those sprites rather than failing.
+
+Those asset textures were the last blocker: they are not `TEXV0005` containers
+but a `TEXB` block whose payload is **LZ4**, and whose sizes are 16.16 fixed
+point (`>> 8`), with the mip count at `+16` and each mip's level stored in the
+block. `TEXB0003` is single-level; `TEXB0004` carries mip levels. Decoding both
+made the particle chain render: `scenecompose <pkg> out.png 1920 1080 fill 6`
+draws **19 particles** where it previously drew none.
 
 **3. The effect pipeline itself**, then effects in frequency order. The pipeline
 is the hard part; individual effects after it are incremental.
+
+An effect is not a built-in: the creator ships `effects/<name>/effect.json`
+pointing at a material whose shader is ordinary GLSL inside the package. So the
+host side of the contract is what has to be right, and it is implemented in
+`crates/core/src/effect.rs`: the chain
+`effect.json -> passes[].material -> material passes[].shader -> shaders/<name>.{frag,vert}`,
+`#include` expansion, the engine prelude (these shaders rely on built-ins that
+appear nowhere in the file — `texSample2D`, `mul`, `saturate`, the `CAST`
+helpers), and uniform bindings read from the JSON comment each declaration
+carries (`uniform float g_Scale; // {"material":"…ripple_scale","default":1}`).
+
+Measured over the library with
+`cargo run -p hyprwpe-core --example validate_effects`:
+**91 distinct effects, 2896 shader stages prepared, 0 failures**, 17485 uniform
+declarations of which 9681 bind to a material constant. Two lookup rules each
+gated the entire library: includes resolve both bare and under `shaders/` (the
+engine keeps `common*.h` there and every effect includes at least one), and
+`usershadervalues` binds a uniform to a user property.
+
+What remains for pixels is the GL side: a framebuffer ping-pong that runs each
+object's effect passes in order, with the constants resolved from the scene and
+the object's own `constantshadervalues`.
 
 **4. Text (18/75) and sound (41/75).** Sound is common but not visual — silence
 is a much smaller defect than a missing layer, so it ranks below anything that
 affects the image.
 
 **5. Light.** 2/75. Only for completeness.
+
+## User properties — the settings
+
+A wallpaper's settings are declared, never invented: the creator lists them in
+`general.properties` (in `project.json`, and inside the package's `scene.json`),
+and they are what makes two installs of one wallpaper differ. Nine types cover
+the whole library — `bool`, `slider`, `color`, `combo`, `textinput`,
+`texture`/`scenetexture`, `usershortcut`, plus the layout-only `group` and
+`text` — and an unknown type is preserved rather than dropped, so a newer engine
+version degrades to "shown, value passed through".
+
+Measured with `cargo run -p hyprwpe-core --example validate_properties`:
+**597 properties across all 95 items** (570 editable — bool 218, color 147,
+slider 137, combo 33, textinput 22, group 16, text 11, texture 4, and 9 with no
+type), of which **373 are wired to a field** in their scene. The validator also
+reports the **425 SceneScript bindings**, which is the honest limit: those fields
+are driven by JavaScript the engine runs and hyprwpe does not, so `hyprwpe
+properties` says so instead of letting a setting look broken.
+
+The binding is **generic** — any field may carry one, so there is no per-field
+table:
+
+```jsonc
+"alpha":  {"user":"bladesopacity","value":1.0}                  // mirrors the property
+"visible":{"user":{"name":"eye","condition":"1"},"value":true}  // shown while it equals "1"
+"origin": {"script":"…js…","value":"0 0 0"}                     // SceneScript: counted, skipped
+```
+
+Conditions **gate** rather than invert, and that is read from the data: the
+library authors `clocklocation` as six objects, `true` for option 1 and `false`
+for options 2..5, and `timeofday` as ten each for options 3 and 4. Inverting on a
+non-match — the first implementation — would put every clock location on screen
+at once.
+
+End to end: `State::set_property` validates a value against the wallpaper's own
+declaration and returns what actually stuck (a `99` on a `0..1` slider is stored
+as `1`), merging rather than replacing so setting one value does not reset the
+rest. `WallpaperSpec` carries the resolved set so the render loop never reads
+disk. Changed values are visible as pixels through the shared transform path:
+
+```
+scenecompose <2387296214/scene.pkg> out.png 1920 1080 fill 4 --set crtfilter=false
+```
+
+drops the frame from 12 layers to 11 and changes **98.92%** of pixels (mean luma
+32.97 → 16.13); `2441947759`'s `flygononoff` changes 0.207%.
 
 ## Honesty rule
 

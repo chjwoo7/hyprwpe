@@ -350,6 +350,46 @@ selection killing its own siblings — cannot occur. Mixed setups (a scene on DP
 a still image on eDP-1) are just two renderers in one process holding two
 surfaces.
 
+## Configuration and saved state
+
+Two files, because they answer different questions and have different owners.
+
+**`$XDG_CONFIG_HOME/hyprwpe/config.toml`** is what the user wrote. hyprwpe reads
+it and never writes it, so hand-edits and comments survive.
+
+```toml
+default_scaling = "fill"
+
+[general]
+suspend_delay_ms = 1500      # occlusion hysteresis; lower thrashes, higher burns power
+pause_on_fullscreen = true   # suspend behind a fullscreen window
+fps_limit = 0                # 0 = uncapped; 60 on a 165 Hz panel saves renders
+
+[[source]]
+kind = "workshop"
+path = "~/.steam/root/steamapps/workshop/content/431960"
+```
+
+A missing file means defaults, never an error: a first run with nothing
+configured must still show the user their library. A *broken* file prints what is
+wrong and continues with defaults rather than leaving a black screen. `hyprwpe
+config` prints the **effective** configuration — defaults included — because a
+user asking what is in effect should not have to work out which keys they left
+out.
+
+**`$XDG_STATE_HOME/hyprwpe/state.json`** is what hyprwpe was last doing: the
+per-output assignment (so a wallpaper survives a restart) and the user's saved
+values for each wallpaper's settings. It is derived from what the renderer
+already holds rather than tracked separately, so the file cannot drift from what
+is on screen, and it is written atomically so a kill mid-write cannot leave a
+truncated file the next start refuses to read. Entries whose wallpaper has since
+been deleted are pruned on load.
+
+Per-wallpaper **user properties** are the one piece of state a person edits —
+through `hyprwpe set-property`, the IPC, or a settings panel — so they live here
+rather than in the config file. Only the chosen values are stored; the
+declarations always come from the wallpaper's own package.
+
 ## Lifecycle state machine
 
 ```

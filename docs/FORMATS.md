@@ -156,6 +156,41 @@ An object's kind is implied by which key it carries — `image`, `particle`,
 appearance keys (`origin`, `scale`, `angles`, `visible`, `parallaxDepth`,
 `alpha`, `color`, `effects`, `parent`) are shared across kinds.
 
+### User properties and value bindings — confirmed
+
+Beyond the geometry, `general.properties` declares the settings the creator
+exposes (`project.json` carries the panel metadata; the packed `scene.json`
+carries them too). Nine `type` values cover the whole library — `bool`,
+`slider`, `color`, `combo`, `textinput`, `texture`/`scenetexture`,
+`usershortcut`, and the layout-only `group` and `text` — with `min`/`max`/`step`/
+`precision`/`fraction` on a slider, `options[{label,value}]` on a combo, and
+`text`/`order`/`index` for the panel. 597 declarations across 95 items.
+
+The mechanism that makes them apply is a **binding that may replace any field's
+value** — not a fixed set of bindable keys, which is why a renderer must resolve
+them generically rather than field by field:
+
+```jsonc
+// plain: the field mirrors the property
+"alpha":  {"user": "bladesopacity", "value": 1.0}
+
+// combo: the field is shown only while the property equals `condition`
+"visible": {"user": {"name": "clocklocation", "condition": "1"}, "value": true}
+
+// SceneScript: per-frame JavaScript. The static `value` is what a host that
+// does not run JS can use; 425 of these exist in the library.
+"origin": {"script": "'use strict';…", "value": "0 0 0"}
+```
+
+A `condition` **gates**; it does not invert. That is settled by the data, not by
+preference: `clocklocation` binds six objects with `true` for option 1 and
+`false` for options 2..5, and `timeofday` binds ten for option 3 (all `true`)
+and ten for option 4 (all `true`). Reading a non-match as an inversion would
+display every clock location simultaneously.
+
+Saved user values are keyed by the wallpaper and hold `{key: {"value": v}}`,
+the same wrapping the declarations use.
+
 ### Transform semantics (validated against the corpus)
 
 - `general.orthogonalprojection {width, height}` names the **design canvas**,
@@ -384,6 +419,49 @@ is decoded directly with the `image` crate (dimensions and pixels both come
 from the embedded image, so the 16.16 header is informational). Raw-BC payloads
 (`TEXB0002`) are decompressed with the built-in DXT1/3/5 decoders, matching the
 declared dimensions.
+
+### Engine asset textures are `TEXB` + **LZ4** — confirmed
+
+The textures Wallpaper Engine ships in its own `assets/` directory (what particles
+reference) do **not** follow the container above, and this cost real time:
+
+```
+"TEXB0003" / "TEXB0004"
+u32  flags
+u32  format                       (same enumeration as elsewhere)
+u32  width   (16.16 fixed, >> 8)
+u32  height  (16.16 fixed, >> 8)
+u32  ?                            usually width  * 256 again
+u32  ?                            usually height * 256 again
+u32  mipcount                     (at +16 from the magic)
+...   per-mip table
+LZ4   block payload               starts at magic + 41
+```
+
+Three details, each of which made a first attempt fail:
+
+- **The sizes are 16.16 fixed point**, exactly like `TEXV0005`. Reading them raw
+  gives a width 256× too large, and the DXT decode then fails on a size mismatch.
+- **The payload is an LZ4 block**, not zlib, zstd-frame or lzma. For
+  `materials/particle/halo_*.tex` the LZ4 block begins at `magic + 41` and
+  consumes the remainder of the file exactly.
+- **`TEXB0003` is single-level; `TEXB0004` carries `mipcount` levels** with a
+  per-level table, so a decoder that assumes one level reads mip data as pixels.
+
+Verified against the engine's own assets: decoded, `halo` is the glow sprite it
+should be (centre `ffffffeb`, corners alpha 0, mean alpha 38.8). `lz4_flex` does
+the block decode and is the crate's only new dependency for this.
+
+### Engine assets — resolved at runtime, never redistributed
+
+Wallpaper Engine's installation carries what a wallpaper legitimately expects to
+exist but does not ship itself: `assets/shaders/**` (including the `common*.h`
+preludes every effect shader includes), `assets/materials/particle/**` (108 of
+the 130 particle textures the corpus references), `assets/particles/presets/**`
+and `assets/fonts/**` (for text objects). `crates/core/src/assets.rs` resolves a
+name **package first, then the engine's `assets/` directory**, so nothing is
+redistributed with hyprwpe and a machine without Wallpaper Engine installed loses
+only those sprites and fonts rather than failing to render.
 
 ### Materials reference textures relative to `materials/`
 
