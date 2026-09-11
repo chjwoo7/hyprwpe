@@ -1,11 +1,13 @@
 //! Shared model for hyprwpe: what wallpapers exist and how to read them.
 
 pub mod animation;
+pub mod assets;
 pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod hyprland;
 pub mod mdlv;
+pub mod particle;
 pub mod pkg;
 pub mod protocol;
 pub mod scene;

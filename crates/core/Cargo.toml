@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
 image = { workspace = true }
+lz4_flex = "0.14.0"

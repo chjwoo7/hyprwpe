@@ -549,6 +549,22 @@ impl SceneObject {
         }
     }
 
+    /// Path to the particle definition if this is a particle object.
+    ///
+    /// The field is normally a plain string, but the editor can also write it as
+    /// an object with a `file` key, so both are accepted.
+    pub fn particle_path(&self) -> Option<String> {
+        let val = self.particle.as_ref()?;
+        match val {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Object(map) => map
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
     pub fn is_visible(&self) -> bool {
         self.visible.unwrap_or(true)
     }

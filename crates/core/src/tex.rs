@@ -23,14 +23,16 @@ use std::path::Path;
 /// Texture compression formats supported by Wallpaper Engine `.tex` files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TexFormat {
+    /// An embedded PNG/JPEG payload that the `image` crate decodes.
+    Image,
     Rgba8,
     Rgb8,
+    /// Two-channel data (a flow or mask map); decoded as grey with `g` as alpha.
+    Rg8,
     R8,
     Dxt1,
     Dxt3,
     Dxt5,
-    /// Embedded PNG/JPEG payload (no raw BC decode needed).
-    Image,
     Unknown(u32),
 }
 
@@ -96,9 +98,7 @@ fn find_sig(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 impl TexImage {
@@ -218,54 +218,103 @@ impl TexImage {
         })
     }
 
-    /// Decode the texture into standard 32-bit RGBA8 pixels (`width * height * 4` bytes).
-        pub fn to_rgba8(&self) -> Result<Vec<u8>> {
-            let w = self.width as usize;
-            let h = self.height as usize;
-            let expected_pixels = w * h;
-
-            match self.format {
-                // Embedded image payloads decode through the image crate.
-                TexFormat::Image => {
-                    let img = image::load_from_memory(&self.data)
-                        .context("decoding embedded image payload")?;
-                    Ok(img.to_rgba8().into_raw())
-                }
-                TexFormat::Rgba8 => {
-                    if self.data.len() >= expected_pixels * 4 {
-                        Ok(self.data[..expected_pixels * 4].to_vec())
-                    } else {
-                        bail!("insufficient data for RGBA8 texture");
-                    }
-                }
-                TexFormat::Rgb8 => {
-                    if self.data.len() < expected_pixels * 3 {
-                        bail!("insufficient data for RGB8 texture");
-                    }
-                    let mut out = Vec::with_capacity(expected_pixels * 4);
-                    for rgb in self.data[..expected_pixels * 3].chunks_exact(3) {
-                        out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-                    }
-                    Ok(out)
-                }
-                TexFormat::R8 => {
-                    if self.data.len() < expected_pixels {
-                        bail!("insufficient data for R8 texture");
-                    }
-                    let mut out = Vec::with_capacity(expected_pixels * 4);
-                    for &r in &self.data[..expected_pixels] {
-                        out.extend_from_slice(&[r, r, r, 255]);
-                    }
-                    Ok(out)
-                }
-                TexFormat::Dxt1 => decompress_dxt1(self.width, self.height, &self.data),
-                TexFormat::Dxt3 => decompress_dxt3(self.width, self.height, &self.data),
-                TexFormat::Dxt5 => decompress_dxt5(self.width, self.height, &self.data),
-                TexFormat::Unknown(fmt) => {
-                    bail!("unsupported texture format {fmt}");
-                }
+    /// Parse a texture, using its `.tex-json` sidecar when present.
+    ///
+    /// Wallpaper Engine's **built-in asset** textures (`assets/materials/**`)
+    /// differ from a workshop package's: they are not embedded PNG/JPEG but a
+    /// small header plus an **LZ4-compressed** raw pixel block, and the pixel
+    /// format is stated in the sidecar rather than the file. Without the sidecar
+    /// those files look like a block format with wrong dimensions, which is why
+    /// they used to fail to decode.
+    ///
+    /// Layout, verified on the engine's own assets (`assets/materials/particle/*`),
+    /// offsets counted from the `TEXB####` magic:
+    ///
+    /// ```text
+    /// +8   u32  flags
+    /// +12  u32
+    /// +16  u32  levels << 8 | 0xFF      (1 for a single level)
+    /// +20  u32  width  << 8             (16.16 fixed point)
+    /// +24  u32  height << 8
+    /// +28  u32
+    /// +32  u32  uncompressed byte size
+    /// +36  u32  compressed byte size
+    /// +40  u8   0
+    /// +41  ..   LZ4 block, `compressed byte size` long
+    /// ```
+    ///
+    /// Only the single-level case is decoded: when a texture carries mip levels
+    /// the payload's codec is not the same and is not yet known, so those fall
+    /// back to the generic parser (and typically fail, which is honest).
+    pub fn parse_with_sidecar(bytes: &[u8], sidecar: Option<&[u8]>) -> Result<Self> {
+        if let Some(fmt) = sidecar.and_then(sidecar_format) {
+            if let Some(img) = parse_asset_texb(bytes, fmt) {
+                return Ok(img);
             }
         }
+        Self::parse(bytes)
+    }
+
+    /// Decode the texture into standard 32-bit RGBA8 pixels (`width * height * 4` bytes).
+    pub fn to_rgba8(&self) -> Result<Vec<u8>> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let expected_pixels = w * h;
+
+        match self.format {
+            // Embedded image payloads decode through the image crate.
+            TexFormat::Image => {
+                let img = image::load_from_memory(&self.data)
+                    .context("decoding embedded image payload")?;
+                Ok(img.to_rgba8().into_raw())
+            }
+            TexFormat::Rgba8 => {
+                if self.data.len() >= expected_pixels * 4 {
+                    Ok(self.data[..expected_pixels * 4].to_vec())
+                } else {
+                    bail!("insufficient data for RGBA8 texture");
+                }
+            }
+            TexFormat::Rgb8 => {
+                if self.data.len() < expected_pixels * 3 {
+                    bail!("insufficient data for RGB8 texture");
+                }
+                let mut out = Vec::with_capacity(expected_pixels * 4);
+                for rgb in self.data[..expected_pixels * 3].as_chunks::<3>().0 {
+                    out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+                Ok(out)
+            }
+            TexFormat::R8 => {
+                if self.data.len() < expected_pixels {
+                    bail!("insufficient data for R8 texture");
+                }
+                let mut out = Vec::with_capacity(expected_pixels * 4);
+                for &r in &self.data[..expected_pixels] {
+                    out.extend_from_slice(&[r, r, r, 255]);
+                }
+                Ok(out)
+            }
+            // Two channels: the first reads as brightness, the second as
+            // opacity, which is what a particle flow/mask pair means.
+            TexFormat::Rg8 => {
+                if self.data.len() < expected_pixels * 2 {
+                    bail!("insufficient data for RG8 texture");
+                }
+                let mut out = Vec::with_capacity(expected_pixels * 4);
+                for px in self.data[..expected_pixels * 2].as_chunks::<2>().0 {
+                    out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+                }
+                Ok(out)
+            }
+            TexFormat::Dxt1 => decompress_dxt1(self.width, self.height, &self.data),
+            TexFormat::Dxt3 => decompress_dxt3(self.width, self.height, &self.data),
+            TexFormat::Dxt5 => decompress_dxt5(self.width, self.height, &self.data),
+            TexFormat::Unknown(fmt) => {
+                bail!("unsupported texture format {fmt}");
+            }
+        }
+    }
 
     /// Decode to an RGBA image, using the image crate for embedded payloads
     /// and the DXT decoders for raw block data.
@@ -350,13 +399,85 @@ fn dims_from_payload(bytes: &[u8]) -> Result<(u32, u32, usize, TexFormat)> {
 }
 
 fn blocks_for(width: u32, height: u32) -> u64 {
-    ((width as u64 + 3) / 4) * ((height as u64 + 3) / 4)
+    (width as u64).div_ceil(4) * (height as u64).div_ceil(4)
 }
 
 fn find_texb(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(8)
         .position(|w| w.starts_with(b"TEXB") && w[4..8].iter().all(|b| b.is_ascii_digit()))
+}
+
+/// The pixel format named by a `.tex-json` sidecar, e.g. `{"format":"rgba8888"}`.
+///
+/// The engine writes the format in the sidecar rather than in the `.tex`, which
+/// is why an asset texture cannot be decoded without it.
+fn sidecar_format(sidecar: &[u8]) -> Option<TexFormat> {
+    let v: serde_json::Value = serde_json::from_slice(sidecar).ok()?;
+    let name = v.get("format")?.as_str()?.to_ascii_lowercase();
+    match name.as_str() {
+        "rgba8888" | "rgba8888n" | "argb8888" | "argb8888n" => Some(TexFormat::Rgba8),
+        "rgb888" => Some(TexFormat::Rgb8),
+        "rg88" | "rg88n" => Some(TexFormat::Rg8),
+        "r8" | "r8n" => Some(TexFormat::R8),
+        "dxt1" | "dxt1n" => Some(TexFormat::Dxt1),
+        "dxt3" | "dxt3n" => Some(TexFormat::Dxt3),
+        "dxt5" | "dxt5n" => Some(TexFormat::Dxt5),
+        _ => None,
+    }
+}
+
+/// Decode a Wallpaper Engine **asset** texture: a single-level `TEXB` block whose
+/// payload is an LZ4 block of raw pixels.
+///
+/// Returns `None` for anything that is not that shape (a mip chain, an embedded
+/// image, a corrupt header), so the caller can fall back to the generic parser.
+fn parse_asset_texb(bytes: &[u8], format: TexFormat) -> Option<TexImage> {
+    if !bytes.starts_with(b"TEXV0005") {
+        return None;
+    }
+    let tb = find_texb(bytes)?;
+    let u32at = |o: usize| -> Option<u32> {
+        let s = bytes.get(o..o + 4)?;
+        Some(u32::from_le_bytes(s.try_into().ok()?))
+    };
+    // A mip chain uses a different payload codec, which is not implemented.
+    if u32at(tb + 16)? >> 8 != 1 {
+        return None;
+    }
+    let width = u32at(tb + 20)? >> 8;
+    let height = u32at(tb + 24)? >> 8;
+    // The size fields are 16.16 fixed point too.
+    let raw_size = (u32at(tb + 32)? >> 8) as usize;
+    let compressed = (u32at(tb + 36)? >> 8) as usize;
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return None;
+    }
+    let bpp = match format {
+        TexFormat::Rgba8 => 4,
+        TexFormat::Rgb8 => 3,
+        TexFormat::Rg8 => 2,
+        TexFormat::R8 => 1,
+        _ => return None,
+    };
+    let expected = (width as usize) * (height as usize) * bpp;
+    // The header's own sizes must agree with the format before trusting them.
+    if raw_size != expected {
+        return None;
+    }
+    let start = tb + 41;
+    let end = (start + compressed).min(bytes.len());
+    let payload = bytes.get(start..end)?;
+    let data = lz4_flex::block::decompress(payload, expected).ok()?;
+    if data.len() != expected {
+        return None;
+    }
+    Some(TexImage {
+        width,
+        height,
+        format,
+        data,
+    })
 }
 
 trait FormatFallback {
@@ -682,7 +803,7 @@ mod tests {
         header.extend_from_slice(&512u32.to_le_bytes());
         header.extend_from_slice(&(32u32 << 8).to_le_bytes()); // w * 256
         header.extend_from_slice(&(32u32 << 8).to_le_bytes()); // h * 256
-        // Inner sub-block with a plausible header + DXT5 payload.
+                                                               // Inner sub-block with a plausible header + DXT5 payload.
         header.extend_from_slice(b"TEXB0003");
         header.extend_from_slice(&0x100u32.to_le_bytes());
         header.extend_from_slice(&0xffffffffu32.to_le_bytes());

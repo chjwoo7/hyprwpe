@@ -9,13 +9,16 @@
 //! Usage: `cargo run -p hyprwpe-render --example scenecompose -- \
 //!         <scene.pkg> <out.png> [width] [height] [fill|fit|stretch|center]`
 
-use hyprwpe_core::pkg::Package;
+use hyprwpe_core::assets::Resources;
+use hyprwpe_core::particle as particle_def;
 use hyprwpe_core::scene::{ObjectKind, Scene};
 use hyprwpe_core::tex::TexImage;
+use hyprwpe_render::particle::Sim as ParticleSim;
 use hyprwpe_render::scaling::Scaling;
 use hyprwpe_render::scene_layer::resolve_puppet_file;
 use hyprwpe_render::scene_transform::{
-    animated_alpha, animated_world_transforms, canvas_map, clear_color, puppet_placement, Affine,
+    animated_alpha, animated_world_transforms, canvas_map, clear_color, particle_sprite_transform,
+    puppet_placement, Affine,
 };
 use hyprwpe_render::skin::{deform, Rig};
 use image::{Rgba, RgbaImage};
@@ -30,7 +33,7 @@ fn is_image_file(path: &str) -> bool {
         || lower.ends_with(".bmp")
 }
 
-fn resolve_texture_entry(pkg: &Package, name: &str) -> Option<String> {
+fn resolve_texture_entry(pkg: &Resources, name: &str) -> Option<String> {
     if is_image_file(name) {
         let rooted = format!("materials/{name}");
         return pkg
@@ -48,19 +51,19 @@ fn resolve_texture_entry(pkg: &Package, name: &str) -> Option<String> {
     None
 }
 
-fn resolve_texture_file(pkg: &Package, image_ref: &str) -> Option<String> {
+fn resolve_texture_file(pkg: &Resources, image_ref: &str) -> Option<String> {
     if is_image_file(image_ref) {
         return pkg.get(image_ref).is_some().then(|| image_ref.to_string());
     }
     let model = pkg.get_str(image_ref)?;
-    let model: serde_json::Value = serde_json::from_str(model).ok()?;
+    let model: serde_json::Value = serde_json::from_str(&model).ok()?;
     match model.get("material").and_then(|m| m.as_str()) {
         Some(material) => {
             if is_image_file(material) {
                 return pkg.get(material).is_some().then(|| material.to_string());
             }
             let mat = pkg.get_str(material)?;
-            let mat: serde_json::Value = serde_json::from_str(mat).ok()?;
+            let mat: serde_json::Value = serde_json::from_str(&mat).ok()?;
             let texture_name = mat
                 .get("passes")
                 .and_then(|p| p.as_array())
@@ -98,13 +101,13 @@ fn resolve_texture_file(pkg: &Package, image_ref: &str) -> Option<String> {
     }
 }
 
-fn load_rgba(pkg: &Package, path: &str) -> Option<RgbaImage> {
-    let raw = pkg.get(path)?;
+fn load_rgba(pkg: &Resources, path: &str) -> Option<RgbaImage> {
+    let (raw, sidecar) = pkg.texture(path)?;
     let img = if path.ends_with(".tex") {
-        let tex = TexImage::parse(raw).ok()?;
+        let tex = TexImage::parse_with_sidecar(&raw, sidecar.as_deref()).ok()?;
         tex.to_rgba_image().ok()?
     } else {
-        image::load_from_memory(raw).ok()?.to_rgba8()
+        image::load_from_memory(&raw).ok()?.to_rgba8()
     };
     // Mirror scene_layer's guard: refuse degenerate decodes that would paint
     // stretched scanline noise instead of a layer.
@@ -122,6 +125,83 @@ struct Layer {
     color: [f32; 4],
 }
 
+/// A running particle system, ready to rasterise at a requested time.
+struct ParticleSys {
+    sim: ParticleSim,
+    img: RgbaImage,
+    placement: Affine,
+    color: [f32; 4],
+}
+
+/// Draw a textured `-1..1` quad through `to_design`, inverse-mapped the same way
+/// the GL renderer samples it. Shared by image layers and particle sprites so a
+/// sprite cannot be placed differently from a layer.
+#[allow(clippy::too_many_arguments)]
+fn raster_quad(
+    canvas: &mut RgbaImage,
+    map: &hyprwpe_render::scene_transform::CanvasMap,
+    img: &RgbaImage,
+    to_design: &Affine,
+    color: [f32; 4],
+    w_f: f32,
+    h_f: f32,
+) {
+    let Some(inv) = to_design.invert() else {
+        return;
+    };
+    let to_px =
+        |dx: f32, dy: f32| -> (f32, f32) { (map.x + dx * map.sx, h_f - (map.y + dy * map.sy)) };
+    let corners = [
+        to_design.apply(-1.0, -1.0),
+        to_design.apply(1.0, -1.0),
+        to_design.apply(-1.0, 1.0),
+        to_design.apply(1.0, 1.0),
+    ];
+    let (mut minx, mut maxx) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut miny, mut maxy) = (f32::INFINITY, f32::NEG_INFINITY);
+    for (dx, dy) in corners {
+        let (px, py) = to_px(dx, dy);
+        minx = minx.min(px);
+        maxx = maxx.max(px);
+        miny = miny.min(py);
+        maxy = maxy.max(py);
+    }
+    let x0 = minx.floor().max(0.0) as i64;
+    let x1 = maxx.ceil().min(w_f) as i64;
+    let y0 = miny.floor().max(0.0) as i64;
+    let y1 = maxy.ceil().min(h_f) as i64;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+
+    let (twf, thf) = (img.width() as f32, img.height() as f32);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let dx = (px as f32 + 0.5 - map.x) / map.sx;
+            let dy = ((h_f - (py as f32 + 0.5)) - map.y) / map.sy;
+            let (u, v) = inv.apply(dx, dy);
+            if !(-1.0..=1.0).contains(&u) || !(-1.0..=1.0).contains(&v) {
+                continue;
+            }
+            // Quad space -> texture UV, matching the GL quad's winding.
+            let su = (u + 1.0) * 0.5 * (twf - 1.0);
+            let sv = (1.0 - v) * 0.5 * (thf - 1.0);
+            let s = sample(img, su, sv);
+            let a = s[3] as f32 / 255.0 * color[3];
+            if a <= 0.0 {
+                continue;
+            }
+            let d = canvas.get_pixel_mut(px as u32, py as u32);
+            let inv_a = 1.0 - a;
+            for (c, sc) in s.iter().take(3).enumerate() {
+                d.0[c] =
+                    ((*sc as f32 * color[c]) * a + d.0[c] as f32 * inv_a).clamp(0.0, 255.0) as u8;
+            }
+            d.0[3] = 255;
+        }
+    }
+}
+
 /// A puppet object: a deforming mesh drawn with its own texture.
 struct Puppet {
     model: hyprwpe_core::mdlv::PuppetModel,
@@ -133,11 +213,11 @@ struct Puppet {
 }
 
 /// The `cropoffset` a model JSON may carry, in model space.
-fn model_cropoffset(pkg: &Package, image_ref: &str) -> [f32; 2] {
+fn model_cropoffset(pkg: &Resources, image_ref: &str) -> [f32; 2] {
     let Some(body) = pkg.get_str(image_ref) else {
         return [0.0, 0.0];
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
         return [0.0, 0.0];
     };
     let Some(s) = v.get("cropoffset").and_then(|c| c.as_str()) else {
@@ -231,6 +311,57 @@ fn raster_puppet(
     }
 }
 
+/// Resolve a particle definition (and its children) into runnable systems.
+fn load_particle_systems(
+    pkg: &Resources,
+    root_ref: &str,
+    placement: Affine,
+    color: [f32; 4],
+) -> Vec<ParticleSys> {
+    let mut out = Vec::new();
+    let mut queue = vec![root_ref.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let mut seed = 0x1234_5678u32;
+    while let Some(path) = queue.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(body) = pkg.get_str(&path) else {
+            continue;
+        };
+        let Ok(system) = particle_def::parse(&body) else {
+            continue;
+        };
+        for c in &system.children {
+            queue.push(c.clone());
+        }
+        let Some(mat) = system.material.clone() else {
+            continue;
+        };
+        let Some(mat_body) = pkg.get_str(&mat) else {
+            continue;
+        };
+        let Some(tex) = particle_def::material_texture(&mat_body) else {
+            continue;
+        };
+        let Some(entry) = resolve_texture_entry(pkg, &tex) else {
+            continue;
+        };
+        let Some(img) = load_rgba(pkg, &entry) else {
+            continue;
+        };
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let cps = system.control_points.clone();
+        out.push(ParticleSys {
+            sim: ParticleSim::new(system, cps, seed),
+            img,
+            placement,
+            color,
+        });
+    }
+    out
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let pkg_path = &args[1];
@@ -253,10 +384,10 @@ fn main() {
         })
         .unwrap_or(0.0);
 
-    let pkg = Package::open(std::path::Path::new(pkg_path)).expect("open pkg");
+    let pkg = Resources::open(std::path::Path::new(pkg_path)).expect("open pkg");
     let scene_json = pkg.get_str("scene.json").expect("scene.json");
-    let scene = Scene::from_json_str(scene_json).expect("scene json");
-    let raw: serde_json::Value = serde_json::from_str(scene_json).unwrap();
+    let scene = Scene::from_json_str(&scene_json).expect("scene json");
+    let raw: serde_json::Value = serde_json::from_str(&scene_json).unwrap();
 
     let design = raw
         .get("general")
@@ -280,7 +411,27 @@ fn main() {
     let world = animated_world_transforms(&scene.objects, &scene.animations, t);
     let mut layers: Vec<Layer> = Vec::new();
     let mut puppets: Vec<Puppet> = Vec::new();
+    let mut particles: Vec<ParticleSys> = Vec::new();
     for (i, obj) in scene.objects.iter().enumerate() {
+        // Particle objects carry no quad; they simulate sprites.
+        if let Some(pref) = obj.particle_path() {
+            if !obj.is_visible() {
+                continue;
+            }
+            let color_rgb = obj
+                .color
+                .map(|c| [c.x(), c.y(), c.z()])
+                .unwrap_or([1.0, 1.0, 1.0]);
+            let anims = scene.animations.get(i).cloned().unwrap_or_default();
+            let alpha = animated_alpha(obj, &anims, t);
+            particles.extend(load_particle_systems(
+                &pkg,
+                &pref,
+                world[i],
+                [color_rgb[0], color_rgb[1], color_rgb[2], alpha],
+            ));
+            continue;
+        }
         if obj.kind() != ObjectKind::Image || !obj.is_visible() {
             continue;
         }
@@ -294,7 +445,7 @@ fn main() {
             let Some(raw) = pkg.get(&mdl_path) else {
                 continue;
             };
-            let Ok(model) = hyprwpe_core::mdlv::parse(raw) else {
+            let Ok(model) = hyprwpe_core::mdlv::parse(&raw) else {
                 eprintln!("  unparsable puppet: {mdl_path}");
                 continue;
             };
@@ -375,64 +526,22 @@ fn main() {
     let w_f = out_w as f32;
     let h_f = out_h as f32;
     for l in &layers {
-        let Some(inv) = l.to_design.invert() else {
-            continue;
-        };
-        // Output-pixel space of the design canvas: x right, y down.
-        let to_px =
-            |dx: f32, dy: f32| -> (f32, f32) { (map.x + dx * map.sx, h_f - (map.y + dy * map.sy)) };
-        let corners = [
-            l.to_design.apply(-1.0, -1.0),
-            l.to_design.apply(1.0, -1.0),
-            l.to_design.apply(-1.0, 1.0),
-            l.to_design.apply(1.0, 1.0),
-        ];
-        let mut minx = f32::INFINITY;
-        let mut maxx = f32::NEG_INFINITY;
-        let mut miny = f32::INFINITY;
-        let mut maxy = f32::NEG_INFINITY;
-        for (dx, dy) in corners {
-            let (px, py) = to_px(dx, dy);
-            minx = minx.min(px);
-            maxx = maxx.max(px);
-            miny = miny.min(py);
-            maxy = maxy.max(py);
-        }
-        let x0 = minx.floor().max(0.0) as i64;
-        let x1 = maxx.ceil().min(w_f) as i64;
-        let y0 = miny.floor().max(0.0) as i64;
-        let y1 = maxy.ceil().min(h_f) as i64;
-        if x1 <= x0 || y1 <= y0 {
-            continue;
-        }
+        raster_quad(&mut canvas, &map, &l.img, &l.to_design, l.color, w_f, h_f);
+    }
 
-        let (twf, thf) = (l.img.width() as f32, l.img.height() as f32);
-        for py in y0..y1 {
-            for px in x0..x1 {
-                // Output pixel -> design units.
-                let dx = (px as f32 + 0.5 - map.x) / map.sx;
-                let dy = ((h_f - (py as f32 + 0.5)) - map.y) / map.sy;
-                let (u, v) = inv.apply(dx, dy);
-                if !(-1.0..=1.0).contains(&u) || !(-1.0..=1.0).contains(&v) {
-                    continue;
-                }
-                // Quad space -> texture UV, matching the GL quad's winding
-                // (v = +1 is the texture's top row).
-                let su = (u + 1.0) * 0.5 * (twf - 1.0);
-                let sv = (1.0 - v) * 0.5 * (thf - 1.0);
-                let s = sample(&l.img, su, sv);
-                let a = s[3] as f32 / 255.0 * l.color[3];
-                if a <= 0.0 {
-                    continue;
-                }
-                let d = canvas.get_pixel_mut(px as u32, py as u32);
-                let inv_a = 1.0 - a;
-                for (c, sc) in s.iter().take(3).enumerate() {
-                    d.0[c] = ((*sc as f32 * l.color[c]) * a + d.0[c] as f32 * inv_a)
-                        .clamp(0.0, 255.0) as u8;
-                }
-                d.0[3] = 255;
-            }
+    // Particle systems: simulate deterministically to the requested time and
+    // draw each sprite through the same quad path the image layers use.
+    for ps in &mut particles {
+        let sprites = ps.sim.advance_to(t);
+        for s in &sprites {
+            let to_design = particle_sprite_transform(&ps.placement, s.pos, s.rotation, s.size);
+            let color = [
+                s.color[0] * ps.color[0],
+                s.color[1] * ps.color[1],
+                s.color[2] * ps.color[2],
+                s.alpha * ps.color[3],
+            ];
+            raster_quad(&mut canvas, &map, &ps.img, &to_design, color, w_f, h_f);
         }
     }
 
@@ -445,9 +554,10 @@ fn main() {
 
     canvas.save(out_path).expect("save");
     println!(
-        "wrote {out_path} ({} layers, {} puppets)",
+        "wrote {out_path} ({} layers, {} puppets, {} particles)",
         layers.len(),
-        puppets.len()
+        puppets.len(),
+        particles.len()
     );
 }
 

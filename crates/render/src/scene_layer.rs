@@ -6,20 +6,22 @@
 
 use anyhow::{bail, Context, Result};
 use glow::HasContext;
-use hyprwpe_core::pkg::Package;
+use hyprwpe_core::assets::Resources;
 use hyprwpe_core::scene::{ObjectKind, Scene};
 use hyprwpe_core::tex::TexImage;
 use std::path::Path;
 
-use crate::scaling::Scaling;
 use crate::mesh::MeshRenderer;
+use crate::particle::Sim as ParticleSim;
+use crate::scaling::Scaling;
 use crate::scene_transform::{
-    animated_alpha, animated_world_transforms, canvas_map, clear_color, puppet_placement,
-    view_window, world_transforms, Affine,
+    animated_alpha, animated_world_transforms, canvas_map, clear_color, particle_sprite_transform,
+    puppet_placement, view_window, world_transforms, Affine,
 };
 use crate::skin::{deform, Rig};
 use hyprwpe_core::animation::Animation;
 use hyprwpe_core::mdlv;
+use hyprwpe_core::particle as particle_def;
 use hyprwpe_core::scene::SceneObject;
 use std::collections::HashMap;
 
@@ -63,12 +65,9 @@ void main() {
 /// y-up orthographic projection.
 const QUAD_VERTICES: [f32; 16] = [
     // bottom-left  (position, uv)
-    -1.0, -1.0, 0.0, 1.0,
-    // bottom-right
-    1.0, -1.0, 1.0, 1.0,
-    // top-left
-    -1.0, 1.0, 0.0, 0.0,
-    // top-right
+    -1.0, -1.0, 0.0, 1.0, // bottom-right
+    1.0, -1.0, 1.0, 1.0, // top-left
+    -1.0, 1.0, 0.0, 0.0, // top-right
     1.0, 1.0, 1.0, 0.0,
 ];
 
@@ -79,10 +78,7 @@ pub struct Mat4(pub [f32; 16]);
 impl Mat4 {
     pub fn identity() -> Self {
         Mat4([
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ])
     }
 
@@ -201,11 +197,7 @@ impl Mat4 {
     pub fn inverse_affine(&self) -> Mat4 {
         let m = &self.0;
         // Column-major storage: element (row, col) is m[col * 4 + row].
-        let a = [
-            [m[0], m[4], m[8]],
-            [m[1], m[5], m[9]],
-            [m[2], m[6], m[10]],
-        ];
+        let a = [[m[0], m[4], m[8]], [m[1], m[5], m[9]], [m[2], m[6], m[10]]];
         let t = [m[12], m[13], m[14]];
         let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
             - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
@@ -280,6 +272,25 @@ struct PuppetLayer {
     positions: Vec<[f32; 2]>,
 }
 
+/// A running particle system: one emitter group with its sprite texture.
+///
+/// A particle object may name several definitions (its own plus `children`), so
+/// an object holds a list of these, all sharing the object's placement.
+struct ParticleLayer {
+    sim: ParticleSim,
+    texture: glow::Texture,
+    /// Object transform applied to every sprite this system emits.
+    placement: Affine,
+    color: [f32; 3],
+    object_index: usize,
+    visible: bool,
+    /// Sprites for the current frame, reused so a frame allocates nothing once
+    /// the population has settled.
+    sprites: Vec<crate::particle::Sprite>,
+    /// Last time `step` was called, so `dt` is measured rather than assumed.
+    last: std::time::Instant,
+}
+
 /// A rendered 2D image layer.
 pub struct RenderLayer {
     pub texture: glow::Texture,
@@ -309,6 +320,8 @@ pub struct ScenePlayer {
     layers: Vec<RenderLayer>,
     /// Puppet objects (skinned meshes) in scene order after the quads.
     puppets: Vec<PuppetLayer>,
+    /// Particle systems, drawn after the image layers and puppets.
+    particles: Vec<ParticleLayer>,
     /// Scene space the projection maps to the surface. `None` means "use the
     /// surface size" (the scene does not declare an orthogonal canvas).
     design: Option<(f32, f32)>,
@@ -352,14 +365,13 @@ impl ScenePlayer {
             path.to_path_buf()
         };
 
-        let pkg = Package::open(&pkg_path)
+        let pkg = Resources::open(&pkg_path)
             .with_context(|| format!("opening scene package {}", pkg_path.display()))?;
 
         let scene_json = pkg
             .get_str("scene.json")
             .context("scene.pkg contains no scene.json")?;
-        let scene = Scene::from_json_str(scene_json)
-            .context("parsing scene.json from package")?;
+        let scene = Scene::from_json_str(&scene_json).context("parsing scene.json from package")?;
 
         unsafe {
             let vs = compile_shader(gl, glow::VERTEX_SHADER, VERTEX_SHADER_SOURCE)?;
@@ -408,8 +420,27 @@ impl ScenePlayer {
             let world = world_transforms(&scene.objects);
             let mut layers = Vec::new();
             let mut puppets = Vec::new();
+            let mut particles = Vec::new();
 
             for (i, obj) in scene.objects.iter().enumerate() {
+                // Particle systems are their own object kind; they have no quad.
+                if let Some(pref) = obj.particle_path() {
+                    let color_rgb = obj
+                        .color
+                        .map(|c| [c.x(), c.y(), c.z()])
+                        .unwrap_or([1.0, 1.0, 1.0]);
+                    particles.extend(load_particle_layers(
+                        &pkg,
+                        gl,
+                        &pref,
+                        &world[i],
+                        color_rgb,
+                        i,
+                        obj.is_visible(),
+                    ));
+                    continue;
+                }
+
                 if obj.kind() != ObjectKind::Image {
                     continue;
                 }
@@ -425,14 +456,17 @@ impl ScenePlayer {
                         resolve_texture_file(&pkg, &mat_path)
                             .and_then(|name| load_texture_from_pkg(&pkg, &name, gl)),
                     ) {
-                        if let Ok(model) = mdlv::parse(raw) {
+                        if let Ok(model) = mdlv::parse(&raw) {
                             let mut mesh = match MeshRenderer::new(gl) {
                                 Ok(m) => m,
                                 Err(_) => continue,
                             };
                             let rest: Vec<[f32; 2]> =
                                 model.mesh.positions.iter().map(|p| [p[0], p[1]]).collect();
-                            if mesh.upload(gl, &rest, &model.mesh.uvs, &model.mesh.indices).is_ok() {
+                            if mesh
+                                .upload(gl, &rest, &model.mesh.uvs, &model.mesh.indices)
+                                .is_ok()
+                            {
                                 let color_rgb = obj
                                     .color
                                     .map(|c| [c.x(), c.y(), c.z()])
@@ -469,7 +503,10 @@ impl ScenePlayer {
                         }
                     }
 
-                    let color_rgb = obj.color.map(|c| [c.x(), c.y(), c.z()]).unwrap_or([1.0, 1.0, 1.0]);
+                    let color_rgb = obj
+                        .color
+                        .map(|c| [c.x(), c.y(), c.z()])
+                        .unwrap_or([1.0, 1.0, 1.0]);
 
                     layers.push(RenderLayer {
                         texture: tex_handle,
@@ -484,11 +521,7 @@ impl ScenePlayer {
             }
 
             let design = Self::design_canvas(&scene);
-            let zoom = scene
-                .general
-                .as_ref()
-                .and_then(|g| g.zoom)
-                .unwrap_or(1.0);
+            let zoom = scene.general.as_ref().and_then(|g| g.zoom).unwrap_or(1.0);
             let animated = scene.animations.iter().any(|m| !m.is_empty());
 
             Ok(ScenePlayer {
@@ -500,6 +533,7 @@ impl ScenePlayer {
                 loc_color,
                 layers,
                 puppets,
+                particles,
                 design,
                 zoom,
                 scaling,
@@ -595,9 +629,8 @@ impl ScenePlayer {
                 // half-extent into the composed transform makes the full quad
                 // exactly `size * scale` design units, centred on the origin and
                 // placed through every ancestor's transform.
-                let model = Mat4::from_affine(
-                    &world.scale_linear(layer.width / 2.0, layer.height / 2.0),
-                );
+                let model =
+                    Mat4::from_affine(&world.scale_linear(layer.width / 2.0, layer.height / 2.0));
 
                 if let Some(loc) = &self.loc_model {
                     gl.uniform_matrix_4_f32_slice(Some(loc), false, &model.0);
@@ -658,6 +691,56 @@ impl ScenePlayer {
                 );
             }
 
+            // Particle systems: advance each simulation by the wall-clock gap
+            // since its last step and draw every sprite as a quad.
+            if !self.particles.is_empty() {
+                gl.bind_vertex_array(Some(self.vao));
+                for p in &mut self.particles {
+                    if !p.visible {
+                        continue;
+                    }
+                    let now = std::time::Instant::now();
+                    let dt = now.duration_since(p.last).as_secs_f32();
+                    p.last = now;
+                    p.sprites = p.sim.step(dt);
+
+                    let placement = if self.animated {
+                        animated_world[p.object_index]
+                    } else {
+                        p.placement
+                    };
+                    let alpha = if self.animated {
+                        animated_alpha(
+                            &self.objects[p.object_index],
+                            &self.animations[p.object_index],
+                            t,
+                        )
+                    } else {
+                        self.objects[p.object_index].alpha()
+                    };
+
+                    gl.bind_texture(glow::TEXTURE_2D, Some(p.texture));
+                    for s in &p.sprites {
+                        let model = Mat4::from_affine(&particle_sprite_transform(
+                            &placement, s.pos, s.rotation, s.size,
+                        ));
+                        if let Some(loc) = &self.loc_model {
+                            gl.uniform_matrix_4_f32_slice(Some(loc), false, &model.0);
+                        }
+                        if let Some(loc) = &self.loc_color {
+                            gl.uniform_4_f32(
+                                Some(loc),
+                                s.color[0] * p.color[0],
+                                s.color[1] * p.color[1],
+                                s.color[2] * p.color[2],
+                                s.alpha * alpha,
+                            );
+                        }
+                        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    }
+                }
+            }
+
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
             gl.use_program(None);
@@ -676,6 +759,9 @@ impl ScenePlayer {
             for p in self.puppets {
                 gl.delete_texture(p.texture);
                 p.mesh.destroy(gl);
+            }
+            for p in self.particles {
+                gl.delete_texture(p.texture);
             }
             gl.delete_program(self.program);
             gl.delete_vertex_array(self.vao);
@@ -699,28 +785,22 @@ impl ScenePlayer {
 /// (`...png`, `...jpg`, `...tex`). A material-texture name (no extension, the
 /// dominant form in the corpus) resolves relative to the package `materials/`
 /// directory; see [`resolve_texture_entry`].
-fn resolve_texture_file(pkg: &Package, image_ref: &str) -> Option<String> {
+fn resolve_texture_file(pkg: &Resources, image_ref: &str) -> Option<String> {
     if is_image_file(image_ref) {
-        return pkg
-            .get(image_ref)
-            .is_some()
-            .then(|| image_ref.to_string());
+        return pkg.get(image_ref).is_some().then(|| image_ref.to_string());
     }
 
     let body = pkg.get_str(image_ref)?;
-    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    let body: serde_json::Value = serde_json::from_str(&body).ok()?;
 
     // A model JSON defers to a material; a material JSON lists textures
     // directly. Both can appear in the scene graph's `image` field.
     if let Some(material) = body.get("material").and_then(|m| m.as_str()) {
         if is_image_file(material) {
-            return pkg
-                .get(material)
-                .is_some()
-                .then(|| material.to_string());
+            return pkg.get(material).is_some().then(|| material.to_string());
         }
         let mat = pkg.get_str(material)?;
-        let mat: serde_json::Value = serde_json::from_str(mat).ok()?;
+        let mat: serde_json::Value = serde_json::from_str(&mat).ok()?;
         material_texture_name(pkg, material, &mat)
     } else {
         material_texture_name(pkg, image_ref, &body)
@@ -730,7 +810,7 @@ fn resolve_texture_file(pkg: &Package, image_ref: &str) -> Option<String> {
 /// Given a material JSON body (and its package path), resolve the first
 /// texture name it lists to a package entry path.
 fn material_texture_name(
-    pkg: &Package,
+    pkg: &Resources,
     material_path: &str,
     mat: &serde_json::Value,
 ) -> Option<String> {
@@ -761,15 +841,83 @@ fn is_image_file(path: &str) -> bool {
         || lower.ends_with(".bmp")
 }
 
+/// Load the particle systems an object names: its own definition plus every
+/// `children` definition, recursively.
+///
+/// Each definition becomes an independent simulation, all sharing the object's
+/// placement. A definition without a material has no sprite to draw and is
+/// skipped rather than rendered as nothing.
+///
+/// # Safety
+/// Calls GL through `load_texture_from_pkg`, so a GL context must be current.
+unsafe fn load_particle_layers(
+    pkg: &Resources,
+    gl: &glow::Context,
+    root_ref: &str,
+    placement: &Affine,
+    color: [f32; 3],
+    object_index: usize,
+    visible: bool,
+) -> Vec<ParticleLayer> {
+    let mut out = Vec::new();
+    let mut queue = vec![root_ref.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    // A stable per-object seed keeps a scene's particle layout repeatable.
+    let mut seed = 0x9e37_79b9u32 ^ (object_index as u32 + 1).wrapping_mul(2654435761);
+
+    while let Some(path) = queue.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(body) = pkg.get_str(&path) else {
+            continue;
+        };
+        let Ok(system) = particle_def::parse(&body) else {
+            continue;
+        };
+        for child in &system.children {
+            queue.push(child.clone());
+        }
+        let Some(mat_path) = system.material.clone() else {
+            continue;
+        };
+        let Some(mat_body) = pkg.get_str(&mat_path) else {
+            continue;
+        };
+        let Some(tex_name) = particle_def::material_texture(&mat_body) else {
+            continue;
+        };
+        let Some(entry) = resolve_texture_entry(pkg, &mat_path, &tex_name) else {
+            continue;
+        };
+        let Some((texture, _, _)) = load_texture_from_pkg(pkg, &entry, gl) else {
+            continue;
+        };
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let control_points = system.control_points.clone();
+        out.push(ParticleLayer {
+            sim: ParticleSim::new(system, control_points, seed),
+            texture,
+            placement: *placement,
+            color,
+            object_index,
+            visible,
+            sprites: Vec::new(),
+            last: std::time::Instant::now(),
+        });
+    }
+    out
+}
+
 /// The `cropoffset` a model JSON may carry, in model space.
 ///
 /// It shifts the mesh before the object transform, and is the only model-space
 /// adjustment a puppet needs.
-fn model_cropoffset(pkg: &Package, image_ref: &str) -> [f32; 2] {
+fn model_cropoffset(pkg: &Resources, image_ref: &str) -> [f32; 2] {
     let Some(body) = pkg.get_str(image_ref) else {
         return [0.0, 0.0];
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
         return [0.0, 0.0];
     };
     let Some(s) = v.get("cropoffset").and_then(|c| c.as_str()) else {
@@ -786,12 +934,12 @@ fn model_cropoffset(pkg: &Package, image_ref: &str) -> [f32; 2] {
 ///
 /// A puppet replaces the flat quad with a deforming mesh, so the renderer needs
 /// to know about it rather than drawing the material texture on a rectangle.
-pub fn resolve_puppet_file(pkg: &Package, image_ref: &str) -> Option<String> {
+pub fn resolve_puppet_file(pkg: &Resources, image_ref: &str) -> Option<String> {
     if is_image_file(image_ref) {
         return None;
     }
     let body = pkg.get_str(image_ref)?;
-    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    let body: serde_json::Value = serde_json::from_str(&body).ok()?;
     let puppet = body.get("puppet")?.as_str()?;
     pkg.get(puppet).is_some().then(|| puppet.to_string())
 }
@@ -803,7 +951,7 @@ pub fn resolve_puppet_file(pkg: &Package, image_ref: &str) -> Option<String> {
 /// directory**, so `"akalibackground2"` and `"workshop/3518.../背景2"` both
 /// resolve to `materials/<name>.tex` (or `.png`/`.jpg`). Handles a name that
 /// already carries an image extension too.
-fn resolve_texture_entry(pkg: &Package, material_path: &str, name: &str) -> Option<String> {
+fn resolve_texture_entry(pkg: &Resources, material_path: &str, name: &str) -> Option<String> {
     let _ = material_path;
     if is_image_file(name) {
         let rooted = format!("materials/{name}");
@@ -828,13 +976,13 @@ fn resolve_texture_entry(pkg: &Package, material_path: &str, name: &str) -> Opti
 /// `.tex` files go through [`TexImage`] (which understands the `TEXV0005`
 /// container and its embedded PNG/JPEG payloads); other image formats decode
 /// directly through the `image` crate.
-fn load_texture_image(pkg: &Package, path: &str) -> Option<image::RgbaImage> {
-    let raw = pkg.get(path)?;
+fn load_texture_image(pkg: &Resources, path: &str) -> Option<image::RgbaImage> {
+    let (raw, sidecar) = pkg.texture(path)?;
     let img = if path.ends_with(".tex") {
-        let tex = TexImage::parse(raw).ok()?;
+        let tex = TexImage::parse_with_sidecar(&raw, sidecar.as_deref()).ok()?;
         tex.to_rgba_image().ok()?
     } else {
-        image::load_from_memory(raw).ok()?.to_rgba8()
+        image::load_from_memory(&raw).ok()?.to_rgba8()
     };
     // A degenerate decode (1px wide/tall, or wildly mismatched) is almost
     // always a mis-parse of an unsupported .tex sub-format. Uploading it and
@@ -849,7 +997,7 @@ fn load_texture_image(pkg: &Package, path: &str) -> Option<image::RgbaImage> {
 
 /// Load and upload texture data from package to GPU.
 unsafe fn load_texture_from_pkg(
-    pkg: &Package,
+    pkg: &Resources,
     path: &str,
     gl: &glow::Context,
 ) -> Option<(glow::Texture, u32, u32)> {
@@ -872,10 +1020,26 @@ unsafe fn load_texture_from_pkg(
         glow::PixelUnpackData::Slice(Some(&pixels)),
     );
 
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MIN_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MAG_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_S,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_T,
+        glow::CLAMP_TO_EDGE as i32,
+    );
 
     gl.bind_texture(glow::TEXTURE_2D, None);
 
@@ -926,6 +1090,7 @@ unsafe fn link_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyprwpe_core::pkg::Package;
 
     #[test]
     fn mat4_identity_and_multiplication() {
@@ -1004,7 +1169,7 @@ mod tests {
         );
     }
 
-    fn make_test_pkg(entries: &[(&str, &[u8])]) -> Package {
+    fn make_test_pkg(entries: &[(&str, &[u8])]) -> Resources {
         let mut bytes = Vec::new();
         let version = b"PKGV0001";
         bytes.extend_from_slice(&(version.len() as u32).to_le_bytes());
@@ -1022,6 +1187,7 @@ mod tests {
             data.extend_from_slice(content);
         }
         bytes.extend_from_slice(&data);
-        Package::parse(bytes).unwrap()
+        // No assets directory: a test package must resolve only from itself.
+        Resources::from_package(Package::parse(bytes).unwrap(), None)
     }
 }

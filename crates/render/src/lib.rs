@@ -5,6 +5,7 @@ pub mod gl;
 pub mod image_layer;
 pub mod mesh;
 pub mod mpv_dl;
+pub mod particle;
 pub mod scaling;
 pub mod scene_layer;
 pub mod scene_transform;
@@ -13,6 +14,7 @@ pub mod skin;
 pub mod video_layer;
 
 pub use image_layer::{Target, WallpaperSpec, Wallpapers};
+pub use particle::Sim as ParticleSim;
 pub use scaling::{place, Placement, Scaling};
 pub use scene_layer::ScenePlayer;
 pub use shader_layer::ShaderPlayer;

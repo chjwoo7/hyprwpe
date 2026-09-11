@@ -142,6 +142,24 @@ pub fn puppet_placement(world: &Affine, crop: [f32; 2]) -> Affine {
     world.mul(&Affine::translate(crop[0], crop[1]))
 }
 
+/// Placement of one particle sprite in design space.
+///
+/// A sprite is a `-1..1` quad like an image layer, but its transform is
+/// per-particle: the object's world transform, then the particle's own position,
+/// rotation and size. Sharing this between the GPU renderer and the software
+/// harness is what lets the harness be trusted for particles too.
+pub fn particle_sprite_transform(
+    world: &Affine,
+    pos: [f32; 3],
+    rotation: f32,
+    size: f32,
+) -> Affine {
+    world
+        .mul(&Affine::translate(pos[0], pos[1]))
+        .mul(&Affine::rotate(rotation))
+        .mul(&Affine::scale(size / 2.0, size / 2.0))
+}
+
 /// The object's own transform: `translate(origin) * rotate(angles.z) * scale(scale)`.
 pub fn local_transform(obj: &SceneObject) -> Affine {
     let origin = obj.origin();
