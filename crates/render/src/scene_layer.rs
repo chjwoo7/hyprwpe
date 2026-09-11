@@ -280,6 +280,11 @@ struct PuppetLayer {
 struct ParticleLayer {
     sim: ParticleSim,
     texture: glow::Texture,
+    /// How the particle's material blends it onto the frame. Additive is common
+    /// here - fog, embers and light shafts are glows - and drawing one with
+    /// straight alpha pastes a dark blob over the scene instead, which is how a
+    /// single fog system turned a whole wallpaper black.
+    blending: crate::effect_pass::Blending,
     /// Object transform applied to every sprite this system emits.
     placement: Affine,
     color: [f32; 3],
@@ -365,6 +370,10 @@ pub struct ScenePlayer {
     last_draw: std::time::Instant,
     /// Whether effect chains run. Off makes the two paths directly comparable.
     effects_enabled: bool,
+    /// Whether particle sprites are drawn. Off isolates the layers, the way
+    /// `effects_enabled` isolates the effects - a scene that goes black with
+    /// both on can then be attributed.
+    particles_enabled: bool,
     /// How many objects carry an effect chain, for `describe`.
     effect_count: usize,
     /// An off-screen target at the output's size, reused by every effect pass.
@@ -652,6 +661,7 @@ impl ScenePlayer {
                 start: std::time::Instant::now(),
                 last_draw: std::time::Instant::now(),
                 effects_enabled: true,
+                particles_enabled: true,
                 effect_count,
                 object_target: None,
                 frame_copy: None,
@@ -708,6 +718,13 @@ impl ScenePlayer {
     /// comparable in a measurement.
     pub fn set_effects_enabled(&mut self, enabled: bool) {
         self.effects_enabled = enabled;
+    }
+
+    /// Turn particle sprite drawing off. The simulations still advance, so a run
+    /// with them off differs from one with them on by exactly the sprites - which
+    /// is what says whether a black frame is the particles or the layers.
+    pub fn set_particles_enabled(&mut self, enabled: bool) {
+        self.particles_enabled = enabled;
     }
 
     /// A short description of what this scene contains, for tools and logs.
@@ -1192,6 +1209,12 @@ impl ScenePlayer {
             // Particle systems: advance each simulation by the wall-clock gap
             // since its last step and draw every sprite as a quad.
             if !self.particles.is_empty() {
+                let draw_sprites = self.particles_enabled;
+                // The program and the quad both have to be current: an effect
+                // chain leaves its own program bound, and drawing through that
+                // one writes whatever its samplers happen to hold - a cleared
+                // target, i.e. black - instead of the sprite.
+                gl.use_program(Some(self.program));
                 gl.bind_vertex_array(Some(self.vao));
                 for p in &mut self.particles {
                     if !p.visible {
@@ -1227,6 +1250,55 @@ impl ScenePlayer {
                     };
 
                     gl.bind_texture(glow::TEXTURE_2D, Some(p.texture));
+                    if !draw_sprites {
+                        continue;
+                    }
+                    // Each system carries its own blend mode: an additive fog
+                    // must add its glow, and drawing it straight-alpha pastes a
+                    // dark blob over the whole scene instead.
+                    match p.blending {
+                        crate::effect_pass::Blending::Additive => {
+                            gl.blend_func(glow::SRC_ALPHA, glow::ONE)
+                        }
+                        crate::effect_pass::Blending::None => gl.disable(glow::BLEND),
+                        crate::effect_pass::Blending::Normal => {
+                            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA)
+                        }
+                    }
+                    // Diagnostic: what each system is about to draw, in design
+                    // units and in the values that actually reach the uniforms. A
+                    // sprite that covers the frame by accident reads as an
+                    // implausible size or a size range of zero, and a black frame
+                    // is attributable from the colours rather than guessed at.
+                    if std::env::var_os("HYPRWPE_DEBUG_PARTICLES").is_some() {
+                        let n = p.sprites.len().max(1) as f32;
+                        let mut mean = [0.0f32; 3];
+                        let mut size_lo = f32::INFINITY;
+                        let mut size_hi: f32 = 0.0;
+                        for s in &p.sprites {
+                            for (mean, c) in mean.iter_mut().zip(s.color) {
+                                *mean += c;
+                            }
+                            size_lo = size_lo.min(s.size);
+                            size_hi = size_hi.max(s.size);
+                        }
+                        for m in &mut mean {
+                            *m /= n;
+                        }
+                        let mean_alpha: f32 = p.sprites.iter().map(|s| s.alpha).sum::<f32>() / n;
+                        eprintln!(
+                            "particles obj {} : {} sprites, size {:?}..{:?}, mean sprite color {:?} alpha {:.3}, object color {:?}, blending {:?}, fx {:?}",
+                            p.object_index,
+                            p.sprites.len(),
+                            if p.sprites.is_empty() { 0.0 } else { size_lo },
+                            size_hi,
+                            mean,
+                            mean_alpha,
+                            p.color,
+                            p.blending,
+                            self.loc_color.is_some(),
+                        );
+                    }
                     for s in &p.sprites {
                         let model = Mat4::from_affine(&particle_sprite_transform(
                             &placement, s.pos, s.rotation, s.size,
@@ -1247,6 +1319,11 @@ impl ScenePlayer {
                     }
                 }
             }
+
+            // Leave straight-alpha blending on: a particle system may have turned
+            // blending off, and the next frame's layers assume it is on.
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
 
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
@@ -1510,6 +1587,20 @@ unsafe fn load_particle_layers(
         let Some(tex_name) = particle_def::material_texture(&mat_body) else {
             continue;
         };
+        // Diagnostic: `HYPRWPE_PARTICLE_ONLY=3,7` loads only those systems, so a
+        // frame that one system ruins can be attributed instead of guessed at.
+        if let Ok(only) = std::env::var("HYPRWPE_PARTICLE_ONLY") {
+            let wanted = only
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok());
+            if !wanted.into_iter().any(|i| i == object_index) {
+                continue;
+            }
+        }
+        // The material states how the sprite lands on the frame. Additive is
+        // what glows use, and it is not cosmetic: drawn with straight alpha, a
+        // fog or ember system pastes dark cover over the scene.
+        let blending = material_blend_mode(&mat_body);
         let Some(entry) = resolve_texture_entry(pkg, &mat_path, &tex_name) else {
             continue;
         };
@@ -1521,6 +1612,7 @@ unsafe fn load_particle_layers(
         out.push(ParticleLayer {
             sim: ParticleSim::new(system, control_points, seed),
             texture,
+            blending,
             placement: *placement,
             color,
             object_index,
@@ -1571,9 +1663,24 @@ pub fn resolve_puppet_file(pkg: &Resources, image_ref: &str) -> Option<String> {
 ///
 /// Corpus evidence (75 scene packages, 475 matching references): the names in
 /// `passes[].textures` / `textures[]` are **relative to the `materials/`
-/// directory**, so `"akalibackground2"` and `"workshop/3518.../背景2"` both
-/// resolve to `materials/<name>.tex` (or `.png`/`.jpg`). Handles a name that
-/// already carries an image extension too.
+/// The blend mode a particle's material names for its first pass.
+///
+/// Only the first pass is read: every particle material in the corpus has one,
+/// and the sprite renderer draws through it.
+fn material_blend_mode(mat_body: &str) -> crate::effect_pass::Blending {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(mat_body) else {
+        return crate::effect_pass::Blending::Normal;
+    };
+    let name = body
+        .get("passes")
+        .and_then(|p| p.as_array())
+        .and_then(|p| p.first())
+        .and_then(|p0| p0.get("blending"))
+        .and_then(|b| b.as_str())
+        .unwrap_or("normal");
+    crate::effect_pass::Blending::parse(name)
+}
+
 fn resolve_texture_entry(pkg: &Resources, material_path: &str, name: &str) -> Option<String> {
     let _ = material_path;
     // A texture name is written three ways in the corpus: as a file relative to
@@ -1671,6 +1778,20 @@ unsafe fn load_texture_from_pkg(
 ) -> Option<(glow::Texture, u32, u32)> {
     let img = load_texture_image(pkg, path)?;
     let (width, height) = img.dimensions();
+    if std::env::var_os("HYPRWPE_DEBUG_PARTICLES").is_some() {
+        // What actually reaches the GPU, at the point it is uploaded. A sprite
+        // that decodes white here and draws black means the fault is in the
+        // draw, not the decode - and one whose mean is zero means the opposite.
+        let px = img.as_raw().as_chunks::<4>().0;
+        let n = px.len().max(1) as f64;
+        let r: u64 = px.iter().map(|p| p[0] as u64).sum();
+        let a: u64 = px.iter().map(|p| p[3] as u64).sum();
+        eprintln!(
+            "upload {path}: {width}x{height} mean rgb {:.1} alpha {:.1}",
+            r as f64 / n,
+            a as f64 / n
+        );
+    }
     let pixels = img.into_raw();
 
     let texture = gl.create_texture().ok()?;

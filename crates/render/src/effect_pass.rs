@@ -41,7 +41,9 @@ pub enum Blending {
 }
 
 impl Blending {
-    fn parse(name: &str) -> Blending {
+    /// The mode a material's pass names. An unknown name is treated as normal
+    /// rather than additive: guessing additive turns a solid object into a glow.
+    pub fn parse(name: &str) -> Blending {
         match name {
             "additive" => Blending::Additive,
             "disabled" | "none" => Blending::None,

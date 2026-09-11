@@ -34,10 +34,30 @@ fn main() {
         };
         let rev = revision(&bytes);
         match TexImage::parse(&bytes) {
-            Ok(t) => println!(
-                "{name}\t{rev}\tok\t{}x{}\t{:?}",
-                t.width, t.height, t.format
-            ),
+            Ok(t) => {
+                // The pixel stats matter as much as the decode: a sprite whose
+                // RGB is zero everywhere is an alpha mask, and colouring a quad
+                // with it paints black where the engine would paint the
+                // particle's own colour.
+                let (rgb, alpha) = match t.to_rgba8() {
+                    Ok(px) => {
+                        let px = px.as_chunks::<4>().0;
+                        let n = px.len();
+                        if n == 0 {
+                            (0.0, 0.0)
+                        } else {
+                            let r: u64 = px.iter().map(|p| p[0] as u64).sum();
+                            let a: u64 = px.iter().map(|p| p[3] as u64).sum();
+                            (r as f64 / n as f64, a as f64 / n as f64)
+                        }
+                    }
+                    Err(_) => (-1.0, -1.0),
+                };
+                println!(
+                    "{name}\t{rev}\tok\t{}x{}\t{:?}\trgb {rgb:.1}\talpha {alpha:.1}",
+                    t.width, t.height, t.format
+                )
+            }
             Err(e) => println!("{name}\t{rev}\tfail\t{e}"),
         }
     }

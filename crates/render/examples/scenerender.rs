@@ -40,6 +40,7 @@ fn main() {
         .unwrap_or(Scaling::Fill);
     let effects = !args.iter().any(|a| a == "--no-effects");
     let json_out = args.iter().any(|a| a == "--json");
+    let particles = !args.iter().any(|a| a == "--no-particles");
     // A scene at t=0 is not representative: particles have not spawned yet and
     // animation is at its first keyframe, so a corpus measured at zero would
     // report a wallpaper as blank when it is simply waiting to start.
@@ -160,6 +161,7 @@ fn main() {
         }
     };
     player.set_effects_enabled(effects);
+    player.set_particles_enabled(particles);
     player.advance_to(at_time);
     let info = player.describe();
     if !json_out {
