@@ -386,8 +386,20 @@ pub fn assemble(source: &str, stage: Stage, defines: &[String]) -> String {
         out.push('\n');
     }
     for d in defines {
+        // `#define NAME value`, not `#define NAME=value`. The preprocessor takes
+        // the macro name up to the first character that cannot be in one, so
+        // `#define VERTICAL=1` defines `VERTICAL` with the body `=1` - and
+        // `#if VERTICAL` then reads `#if =1`, which the driver reports only as
+        // "Syntax error in #if".
+        let (name, value) = match d.split_once('=') {
+            Some((name, value)) => (name, value),
+            // A combo selected by name alone is "on".
+            None => (d.as_str(), "1"),
+        };
         out.push_str("#define ");
-        out.push_str(d);
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(value);
         out.push('\n');
     }
     out.push('\n');
@@ -462,6 +474,28 @@ pub fn stage_of(path: &str) -> Stage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the defines a material or scene supplies must be emitted as
+    /// `#define NAME value`. Writing `#define NAME=value` leaves the macro body
+    /// as `=value`, so a shader's `#if NAME` expands to `#if =value` and the
+    /// driver reports only "Syntax error in #if" - which cost three effect
+    /// passes in a live scene before this was pinned down.
+    #[test]
+    fn supplied_defines_are_written_as_a_name_and_a_value() {
+        let out = assemble(
+            "void main() { }",
+            Stage::Vertex,
+            &["VERTICAL=1".to_string(), "BLENDMODE=2".to_string()],
+        );
+        assert!(out.contains("#define VERTICAL 1"), "{out}");
+        assert!(out.contains("#define BLENDMODE 2"), "{out}");
+        assert!(!out.contains("#define VERTICAL=1"), "{out}");
+
+        // A combo selected by name alone is "on", not an empty macro - an empty
+        // body would make `#if NAME` a syntax error too.
+        let out = assemble("void main() { }", Stage::Vertex, &["MASK".to_string()]);
+        assert!(out.contains("#define MASK 1"), "{out}");
+    }
 
     #[test]
     fn uniform_bindings_read_the_comment_contract() {
@@ -554,7 +588,7 @@ uniform mat4 g_ModelViewProjectionMatrix;
             !out.contains("#ifndef VERTICAL"),
             "no default for a name the caller supplied:\n{out}"
         );
-        assert!(out.contains("#define VERTICAL=1"));
+        assert!(out.contains("#define VERTICAL 1"));
         // A combo the caller did *not* name is still defaulted, or the `#if`
         // would not compile.
         let out = assemble(

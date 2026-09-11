@@ -729,7 +729,14 @@ fn parse_effect_passes(effect_json: &str) -> Result<Vec<PassSpec>> {
 fn combo_value(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Bool(b) => (*b as u8).to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
+        // `#if` takes an integer constant expression, so an integral float has
+        // to lose its decimal point: a JSON `1.0` emitted as `1.0` turns
+        // `#if MODE == 1` into `#if 1.0 == 1`, a syntax error in the
+        // preprocessor rather than a value the compiler can compare.
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => format!("{}", f as i64),
+            _ => n.to_string(),
+        },
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
@@ -797,7 +804,21 @@ unsafe fn link(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Progr
                 .unwrap_or(log.trim())
                 .trim()
                 .to_string();
-            anyhow::bail!("{label} shader: {first}");
+            // Name the offending source line. Driver messages say only
+            // `0(<line>)`, which is a line in the *assembled* source - a
+            // combination of the prelude, the combo defaults and every include -
+            // so without this the number is unusable.
+            let line_no = first
+                .split('(')
+                .nth(1)
+                .and_then(|r| r.split(')').next())
+                .and_then(|n| n.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let excerpt = src
+                .lines()
+                .nth(line_no.saturating_sub(1))
+                .unwrap_or("<out of range>");
+            anyhow::bail!("{label} shader: {first} | assembled line {line_no}: {excerpt}");
         }
         shaders.push(sh);
     }
@@ -1179,10 +1200,14 @@ void main() {
             Stage::Fragment,
             &defines,
         );
-        assert!(assembled.contains("#define VERTICAL=1"), "{assembled}");
-        assert_eq!(assembled.matches("VERTICAL=").count(), 1, "no stale define");
+        assert!(assembled.contains("#define VERTICAL 1"), "{assembled}");
+        assert_eq!(
+            assembled.matches("#define VERTICAL").count(),
+            1,
+            "no stale define"
+        );
         assert!(
-            assembled.contains("#define KERNEL=0"),
+            assembled.contains("#define KERNEL 0"),
             "the other is untouched"
         );
     }
@@ -1193,6 +1218,11 @@ void main() {
         assert_eq!(combo_value(&json!(true)), "1");
         assert_eq!(combo_value(&json!(false)), "0");
         assert_eq!(combo_value(&json!("mode")), "mode");
+        // `#if` needs an integer; a JSON `1.0` must not reach it as `1.0`.
+        assert_eq!(combo_value(&json!(1.0)), "1");
+        assert_eq!(combo_value(&json!(0.0)), "0");
+        // A genuinely fractional value keeps its precision.
+        assert_eq!(combo_value(&json!(1.5)), "1.5");
     }
 
     /// A pass must never read the buffer it writes. The engine names buffers
