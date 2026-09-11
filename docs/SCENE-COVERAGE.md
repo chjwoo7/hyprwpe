@@ -278,6 +278,15 @@ engine-provided uniforms (`g_AudioSpectrum*`) that the engine injects but never
 ships in `assets/shaders/`; their array sizes are not guessable, so they are not
 being invented.
 
+The same harness also links each pass's two stages into a program, because a
+render pass needs a program, not two separate stages — and linking catches an
+interface the stages disagree about (a `varying` never written, a mismatched
+type) that compiling one stage at a time cannot. Measured: **1104 of 1105 pass
+programs link**, so the chain is ready to drive real passes: render an object
+off-screen, run the passes with framebuffer ping-pong, then draw the result.
+Only the single effect that also fails to compile does not link.
+
+
 What remains for pixels is the GL side: a framebuffer ping-pong that runs each
 object's effect passes in order, with the constants resolved from the scene and
 the object's own `constantshadervalues`.
