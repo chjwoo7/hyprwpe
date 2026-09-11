@@ -320,6 +320,10 @@ pub struct RenderLayer {
     /// animation) each frame.
     pub color: [f32; 3],
     pub visible: bool,
+    /// The material samples a render target (`_rt_...`), so this layer's texture
+    /// is the frame drawn so far rather than a file. The copy is taken each time
+    /// the layer is drawn, which is what makes it a post-process.
+    pub samples_frame: bool,
 }
 
 /// A scene player rendering a Wallpaper Engine scene package.
@@ -366,6 +370,9 @@ pub struct ScenePlayer {
     /// An off-screen target at the output's size, reused by every effect pass.
     /// One is enough because layers are drawn one at a time.
     object_target: Option<(glow::Framebuffer, glow::Texture, i32, i32)>,
+    /// A copy of the frame drawn so far, for layers whose material samples a
+    /// render target. Sized to the output and refilled whenever that changes.
+    frame_copy: Option<(glow::Texture, i32, i32)>,
     is_paused: bool,
 }
 
@@ -531,24 +538,54 @@ impl ScenePlayer {
                     continue;
                 }
 
-                let texture_file = resolve_texture_file(&pkg, &mat_path);
-                let Some(tex_name) = texture_file else {
-                    // Silent by default, because most packages reference engine
-                    // assets that only exist on a machine with Wallpaper Engine
-                    // installed. The diagnostic names the object so a genuinely
-                    // broken chain can be told from an absent optional asset.
-                    if std::env::var_os("HYPRWPE_DEBUG_LAYERS").is_some() {
-                        eprintln!(
-                            "  layer obj {i} {:?}: no texture resolved from {:?}",
-                            obj.name.as_deref().unwrap_or("?"),
-                            mat_path
-                        );
-                    }
-                    continue;
-                };
+                // Classify before loading: a material that names no texture is a
+                // flat fill of the object's colour (the engine's `solidlayer`),
+                // and one that names a render target is the frame drawn so far.
+                // Only a name that is actually missing is worth dropping - and
+                // that is silent by default, because most packages reference
+                // engine assets that exist only on a machine with Wallpaper
+                // Engine installed.
+                let (tex_handle, tex_name, tex_w, tex_h, samples_frame) =
+                    match material_texture(&pkg, &mat_path) {
+                        MaterialTexture::File(name) => match load_texture_from_pkg(&pkg, &name, gl)
+                        {
+                            Some((handle, w, h)) => (handle, name, w, h, false),
+                            None => {
+                                if std::env::var_os("HYPRWPE_DEBUG_LAYERS").is_some() {
+                                    eprintln!(
+                                        "  layer obj {i} {:?}: {name:?} would not decode",
+                                        obj.name.as_deref().unwrap_or("?")
+                                    );
+                                }
+                                continue;
+                            }
+                        },
+                        MaterialTexture::Unbound => match solid_texture(gl) {
+                            Some(handle) => (handle, String::from("<flat fill>"), 1, 1, false),
+                            None => continue,
+                        },
+                        // A render-target layer samples the frame drawn so far.
+                        // The real texture is a copy taken each time it is drawn;
+                        // the 1x1 here is only so the layer owns something to
+                        // free, like every other layer.
+                        MaterialTexture::RenderTarget(name) => match solid_texture(gl) {
+                            Some(handle) => (handle, name, 1, 1, true),
+                            None => continue,
+                        },
+                        MaterialTexture::Missing => {
+                            if std::env::var_os("HYPRWPE_DEBUG_LAYERS").is_some() {
+                                eprintln!(
+                                    "  layer obj {i} {:?}: unresolved from {:?}",
+                                    obj.name.as_deref().unwrap_or("?"),
+                                    mat_path
+                                );
+                            }
+                            continue;
+                        }
+                    };
 
-                if let Some((tex_handle, tw, th)) = load_texture_from_pkg(&pkg, &tex_name, gl) {
-                    let mut size = [tw as f32, th as f32];
+                {
+                    let mut size = [tex_w as f32, tex_h as f32];
                     if let Some(s) = obj.size() {
                         if s[0] > 0.0 && s[1] > 0.0 {
                             size = s;
@@ -566,11 +603,23 @@ impl ScenePlayer {
                     let effects = build_effect_chains(&pkg, gl, obj);
                     effect_count += effects.iter().map(|c| c.len()).sum::<usize>();
 
+                    if std::env::var_os("HYPRWPE_DEBUG_LAYERS").is_some() {
+                        eprintln!(
+                            "  draw obj {i} {:?}: {}x{} color {:?} visible {} tex {tex_name}",
+                            obj.name.as_deref().unwrap_or("?"),
+                            size[0],
+                            size[1],
+                            color_rgb,
+                            obj.is_visible()
+                        );
+                    }
+
                     layers.push(RenderLayer {
                         texture: tex_handle,
                         width: size[0],
                         height: size[1],
                         effects,
+                        samples_frame,
                         world: world[i],
                         object_index: i,
                         color: color_rgb,
@@ -605,6 +654,7 @@ impl ScenePlayer {
                 effects_enabled: true,
                 effect_count,
                 object_target: None,
+                frame_copy: None,
                 is_paused: false,
             })
         }
@@ -661,10 +711,23 @@ impl ScenePlayer {
     }
 
     /// A short description of what this scene contains, for tools and logs.
+    ///
+    /// `layers / image objects` is the honest resolution figure: the denominator
+    /// counts the image-kind objects the scene actually wants drawn, so objects
+    /// hidden by a property gate are not counted against us. The ratio then says
+    /// how many of them the texture chain resolved into something drawable.
     pub fn describe(&self) -> String {
+        let image_objects = self
+            .objects
+            .iter()
+            .filter(|o| {
+                o.kind() == ObjectKind::Image && o.particle_path().is_none() && o.is_visible()
+            })
+            .count();
         format!(
-            "{} layers ({} with effects, {} effect passes), {} puppets, {} particle systems, design {:?}, zoom {}, scaling {:?}",
-            self.layers.len(),
+            "{} layers of {} image objects ({} with effects, {} effect passes), {} puppets, {} particle systems, design {:?}, zoom {}, scaling {:?}",
+            self.layers.iter().filter(|l| l.visible).count(),
+            image_objects,
             self.layers.iter().filter(|l| !l.effects.is_empty()).count(),
             self.effect_count,
             self.puppets.len(),
@@ -679,6 +742,55 @@ impl ScenePlayer {
     /// to tell covered pixels from bare ones.
     pub fn clear_color(&self) -> [f32; 4] {
         self.clear
+    }
+
+    /// A texture holding the frame drawn so far, for a render-target layer.
+    ///
+    /// Resized on demand: the output can change (a monitor switch, a scaling
+    /// change) and a copy of the wrong size would break the layer's one-to-one
+    /// mapping with the screen.
+    fn frame_copy_texture(
+        &mut self,
+        gl: &glow::Context,
+        width: i32,
+        height: i32,
+    ) -> Option<glow::Texture> {
+        if let Some((texture, w, h)) = self.frame_copy {
+            if w == width && h == height {
+                return Some(texture);
+            }
+            unsafe {
+                gl.delete_texture(texture);
+            }
+            self.frame_copy = None;
+        }
+
+        unsafe {
+            let texture = gl.create_texture().ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            // Storage only; `copy_tex_image_2d` fills it each time a layer uses it.
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                width,
+                height,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            for (param, value) in [
+                (glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32),
+                (glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, param, value);
+            }
+            self.frame_copy = Some((texture, width, height));
+            Some(texture)
+        }
     }
 
     /// The off-screen target effect passes render into, created on demand and
@@ -870,6 +982,33 @@ impl ScenePlayer {
                     self.objects[layer.object_index].alpha()
                 };
 
+                // A layer whose material samples a render target (the engine's
+                // full-screen layer materials) uses the frame drawn so far. The
+                // copy is taken here, not at load, because that is exactly what
+                // makes the layer a post-process over everything before it.
+                let mut texture = layer.texture;
+                if layer.samples_frame {
+                    match self.frame_copy_texture(gl, width, height) {
+                        Some(copy) => {
+                            gl.bind_texture(glow::TEXTURE_2D, Some(copy));
+                            gl.copy_tex_image_2d(
+                                glow::TEXTURE_2D,
+                                0,
+                                glow::RGBA,
+                                0,
+                                0,
+                                width,
+                                height,
+                                0,
+                            );
+                            texture = copy;
+                        }
+                        // No copy available: drawing the 1x1 placeholder would
+                        // paint a white quad over the scene, so skip instead.
+                        None => continue,
+                    }
+                }
+
                 let debug_fx = std::env::var_os("HYPRWPE_DEBUG_FX").is_some();
                 if debug_fx {
                     eprintln!(
@@ -881,7 +1020,7 @@ impl ScenePlayer {
                     );
                 }
                 if layer.effects.is_empty() || !self.effects_enabled {
-                    gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                     continue;
                 }
@@ -892,7 +1031,7 @@ impl ScenePlayer {
                 // sees what the engine would have given it.
                 let Some((object_fbo, object_texture)) = self.object_target(gl, width, height)
                 else {
-                    gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                     continue;
                 };
@@ -912,7 +1051,7 @@ impl ScenePlayer {
                         alpha,
                     );
                 }
-                gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
                 if debug_fx {
@@ -1006,7 +1145,7 @@ impl ScenePlayer {
                             "hyprwpe: effect chain for object {}: {e:#}",
                             layer.object_index
                         );
-                        gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
+                        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                     }
                 }
@@ -1127,6 +1266,9 @@ impl ScenePlayer {
                 gl.delete_framebuffer(fbo);
                 gl.delete_texture(texture);
             }
+            if let Some((texture, _, _)) = self.frame_copy {
+                gl.delete_texture(texture);
+            }
             for p in self.puppets {
                 gl.delete_texture(p.texture);
                 p.mesh.destroy(gl);
@@ -1206,36 +1348,87 @@ fn build_effect_chains(
 /// dominant form in the corpus) resolves relative to the package `materials/`
 /// directory; see [`resolve_texture_entry`].
 fn resolve_texture_file(pkg: &Resources, image_ref: &str) -> Option<String> {
-    if is_image_file(image_ref) {
-        return pkg.get(image_ref).is_some().then(|| image_ref.to_string());
-    }
-
-    let body = pkg.get_str(image_ref)?;
-    let body: serde_json::Value = serde_json::from_str(&body).ok()?;
-
-    // A model JSON defers to a material; a material JSON lists textures
-    // directly. Both can appear in the scene graph's `image` field.
-    if let Some(material) = body.get("material").and_then(|m| m.as_str()) {
-        if is_image_file(material) {
-            return pkg.get(material).is_some().then(|| material.to_string());
-        }
-        let mat = pkg.get_str(material)?;
-        let mat: serde_json::Value = serde_json::from_str(&mat).ok()?;
-        material_texture_name(pkg, material, &mat)
-    } else {
-        material_texture_name(pkg, image_ref, &body)
+    match material_texture(pkg, image_ref) {
+        MaterialTexture::File(name) => Some(name),
+        _ => None,
     }
 }
 
-/// Given a material JSON body (and its package path), resolve the first
-/// texture name it lists to a package entry path.
-fn material_texture_name(
-    pkg: &Resources,
-    material_path: &str,
-    mat: &serde_json::Value,
-) -> Option<String> {
-    let texture_name = mat
-        .get("passes")
+/// What a scene object's `image` reference finally names.
+///
+/// The distinction matters because three very different things hide behind the
+/// same field, and only one of them is "skip this object":
+///
+/// * a texture file, which is drawn as a textured quad;
+/// * a **render target** (`_rt_...`), which is the frame drawn so far rather
+///   than any file - the engine's own full-screen layer materials are built on
+///   it;
+/// * **no texture at all**, which is a flat fill of the object's colour (the
+///   engine's `solidlayer` material is exactly this);
+/// * a name that is simply not here, which is the only case worth dropping.
+enum MaterialTexture {
+    File(String),
+    RenderTarget(String),
+    Unbound,
+    Missing,
+}
+
+/// Walk the texture chain and classify what it names; see [`MaterialTexture`]
+/// and [`resolve_texture_file`] for the chain itself.
+fn material_texture(pkg: &Resources, image_ref: &str) -> MaterialTexture {
+    if is_image_file(image_ref) {
+        return if pkg.get(image_ref).is_some() {
+            MaterialTexture::File(image_ref.to_string())
+        } else {
+            MaterialTexture::Missing
+        };
+    }
+
+    let Some(body) = pkg.get_str(image_ref) else {
+        return MaterialTexture::Missing;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return MaterialTexture::Missing;
+    };
+
+    // A model JSON defers to a material; a material JSON lists textures
+    // directly. Both can appear in the scene graph's `image` field.
+    let (material_path, mat) = match body.get("material").and_then(|m| m.as_str()) {
+        Some(material) if is_image_file(material) => {
+            return if pkg.get(material).is_some() {
+                MaterialTexture::File(material.to_string())
+            } else {
+                MaterialTexture::Missing
+            };
+        }
+        Some(material) => {
+            let Some(text) = pkg.get_str(material) else {
+                return MaterialTexture::Missing;
+            };
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return MaterialTexture::Missing;
+            };
+            (material.to_string(), parsed)
+        }
+        None => (image_ref.to_string(), body),
+    };
+
+    let Some(name) = declared_texture_name(&mat) else {
+        // The material declares no texture: a flat fill, not a failure.
+        return MaterialTexture::Unbound;
+    };
+    if is_render_target(&name) {
+        return MaterialTexture::RenderTarget(name);
+    }
+    match resolve_texture_entry(pkg, &material_path, &name) {
+        Some(path) => MaterialTexture::File(path),
+        None => MaterialTexture::Missing,
+    }
+}
+
+/// The first texture name a material declares, if any.
+fn declared_texture_name(mat: &serde_json::Value) -> Option<String> {
+    mat.get("passes")
         .and_then(|p| p.as_array())
         .and_then(|p| p.first())
         .and_then(|p0| p0.get("textures"))
@@ -1247,8 +1440,14 @@ fn material_texture_name(
                 .and_then(|t| t.as_array())
                 .and_then(|t| t.first())
                 .and_then(|v| v.as_str())
-        })?;
-    resolve_texture_entry(pkg, material_path, texture_name)
+        })
+        .map(str::to_string)
+}
+
+/// A name like `_rt_FullFrameBuffer` is a render target the engine fills in
+/// itself, not a file to look up.
+fn is_render_target(name: &str) -> bool {
+    name.starts_with("_rt_")
 }
 
 fn is_image_file(path: &str) -> bool {
@@ -1413,6 +1612,49 @@ fn load_texture_image(pkg: &Resources, path: &str) -> Option<image::RgbaImage> {
         return None;
     }
     Some(img)
+}
+
+/// A 1x1 opaque white texture, for a material that declares no texture at all.
+///
+/// The engine's `solidlayer` material is exactly this - a `flat` shader with no
+/// sampler - so the object's own colour is the whole picture. One texture per
+/// such layer keeps ownership simple: it is four bytes, and every layer is freed
+/// the same way regardless of where its texture came from.
+unsafe fn solid_texture(gl: &glow::Context) -> Option<glow::Texture> {
+    let texture = gl.create_texture().ok()?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        1,
+        1,
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelUnpackData::Slice(Some(&[255u8, 255, 255, 255])),
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MIN_FILTER,
+        glow::NEAREST as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MAG_FILTER,
+        glow::NEAREST as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_S,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_T,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    Some(texture)
 }
 
 /// Load and upload texture data from package to GPU.
@@ -1609,5 +1851,46 @@ mod tests {
         bytes.extend_from_slice(&data);
         // No assets directory: a test package must resolve only from itself.
         Resources::from_package(Package::parse(bytes).unwrap(), None)
+    }
+
+    /// A material that declares no texture is a flat fill, and one that declares
+    /// a render target samples the frame. Treating either as "unresolved" drops
+    /// the layer, which is how the engine's own solid and full-screen layers
+    /// disappeared from scenes.
+    #[test]
+    fn material_texture_classifies_flat_fill_and_render_target() {
+        // Model -> material with a `flat` shader and no `textures` list.
+        let model = r#"{"material": "materials/util/solidlayer.json"}"#;
+        let mat = r#"{"passes": [{"shader": "flat"}]}"#;
+        let pkg = make_test_pkg(&[
+            ("models/util/solidlayer.json", model.as_bytes()),
+            ("materials/util/solidlayer.json", mat.as_bytes()),
+        ]);
+        assert!(
+            matches!(
+                material_texture(&pkg, "models/util/solidlayer.json"),
+                MaterialTexture::Unbound
+            ),
+            "a texture-less material paints the object's own colour"
+        );
+
+        // A material naming a render target must not be looked up as a file.
+        let rt = r#"{"passes": [{"shader": "passthrough", "textures": ["_rt_FullFrameBuffer"]}]}"#;
+        let pkg2 = make_test_pkg(&[("materials/util/fullscreenlayer.json", rt.as_bytes())]);
+        assert!(
+            matches!(
+                material_texture(&pkg2, "materials/util/fullscreenlayer.json"),
+                MaterialTexture::RenderTarget(t) if t == "_rt_FullFrameBuffer"
+            ),
+            "a `_rt_` name is the frame drawn so far, not a package entry"
+        );
+
+        // A name that is genuinely absent stays a drop.
+        let named = r#"{"textures": ["nowhere"]}"#;
+        let pkg3 = make_test_pkg(&[("materials/gone.json", named.as_bytes())]);
+        assert!(matches!(
+            material_texture(&pkg3, "materials/gone.json"),
+            MaterialTexture::Missing
+        ));
     }
 }
