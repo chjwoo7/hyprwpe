@@ -306,6 +306,39 @@ screenshot. On a real wallpaper (`1906757512`, `tint` as its final pass):
 | `--set color=1 0 0` | 100.00% | 255.0, 0.0, 0.0 |
 | `--no-effects` | 30.12% | 174.7, 177.7, 177.4 |
 
+### The passes are a render graph, not a chain
+
+An effect's passes do not simply feed each other. Each names the buffer it writes
+(`target`) and which buffer feeds which sampler (`bind`), with `previous` meaning
+the chain's input — a small render graph. `godrays` shows why it matters: its
+cast pass writes a ray mask, and its final `combine` pass reads **both** the mask
+and the untouched input, at two different slots. Feeding every pass the previous
+result (the first implementation) lost the image completely and made those
+wallpapers render **blank**. 17 of the 91 effects need this.
+
+A pass also carries **`combos`**: compile-time branch selectors, not values.
+`VERTICAL` decides whether the same `blur` shader is a horizontal or a vertical
+pass, so a pass built with the wrong branch is not merely different, it can render
+nothing. 45 of the 133 scene effect passes carry at least one; the scene's
+selection overrides the material's, since one material may be used in several
+configurations.
+
+### Whole-library measurement
+
+`tools/measure_scenes.sh` renders every scene headlessly (480x270, `--json` one
+line each) and is the number this document trusts:
+
+| | no effects | effects (after the render graph) |
+| --- | --- | --- |
+| scenes fully covered | 48 / 75 | **55 / 73** |
+| scenes under 10% covered | 11 | **5** |
+
+The effect path is now better than no effects at all, which is the bar worth
+holding it to. The scenes that remain low are ones whose layers are mostly
+particles, puppets or SceneScript-driven text rather than effect failures.
+
+### Bugs the first run exposed
+
 Two bugs came out of it, both invisible to the isolated pass test: uniforms were
 being written **without binding the program** (a `glUniform*` call goes to the
 currently bound program, so every value silently stayed at its default), and an
