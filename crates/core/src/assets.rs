@@ -149,6 +149,17 @@ impl Resources {
         let sidecar = self.get(&format!("{name}-json"));
         Some((bytes, sidecar))
     }
+
+    /// Read a shader source or `#include` target.
+    ///
+    /// A shader says `#include "common.h"`, but the engine keeps those preludes
+    /// under `shaders/`, so the name is resolved both bare and rooted - the same
+    /// rule the engine applies, and the reason a naive lookup fails on every
+    /// single effect (they all include at least one prelude).
+    pub fn shader(&self, name: &str) -> Option<String> {
+        self.get_str(name)
+            .or_else(|| self.get_str(&format!("shaders/{name}")))
+    }
 }
 
 #[cfg(test)]
