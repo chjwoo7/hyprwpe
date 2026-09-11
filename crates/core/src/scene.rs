@@ -365,6 +365,10 @@ pub struct General {
     pub ambientcolor: Option<Vec3>,
     #[serde(default)]
     pub clearcolor: Option<Vec3>,
+    /// Whether the scene asks for its `clearcolor` background to be painted
+    /// behind the layers.
+    #[serde(default, deserialize_with = "deserialize_opt_bool")]
+    pub clearenabled: Option<bool>,
     #[serde(default)]
     pub skylightcolor: Option<Vec3>,
     #[serde(default, deserialize_with = "deserialize_opt_bool")]

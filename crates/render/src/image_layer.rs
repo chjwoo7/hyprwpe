@@ -10,6 +10,7 @@
 //! wraps it in a loop for one-shot use.
 
 use anyhow::{Context, Result};
+use glow::HasContext;
 use hyprwpe_core::protocol::OutputStatus;
 use hyprwpe_core::settings::{Assignment, State};
 use image::{imageops::FilterType, RgbaImage};
@@ -685,7 +686,7 @@ impl Wallpapers {
             let surface = gl.create_surface(&wl_surface, width as i32, height as i32)?;
             gl.make_current(&surface)?;
 
-            let mut player = ScenePlayer::new(&spec.path, &gl.gl)
+            let mut player = ScenePlayer::new(&spec.path, &gl.gl, spec.scaling)
                 .with_context(|| format!("loading scene {}", spec.path.display()))?;
             if self.paused {
                 player.set_paused(true);
@@ -717,7 +718,40 @@ impl Wallpapers {
 
         let (w, h) = surface.size();
         gl.make_current(surface)?;
+        if std::env::var_os("HYPRWPE_DEBUG_SCENE").is_some() {
+            if let Some((ew, eh)) = gl.surface_egl_size(surface) {
+                eprintln!("scene-egl wl_size={}x{} egl_size={}x{}", w, h, ew, eh);
+            }
+        }
         player.render(&gl.gl, w, h)?;
+        if let Some(dir) = std::env::var_os("HYPRWPE_DUMP_FB") {
+            let n = (w as usize) * (h as usize) * 4;
+            let mut buf = vec![0u8; n];
+            unsafe {
+                gl.gl.read_pixels(
+                    0,
+                    0,
+                    w,
+                    h,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut buf)),
+                );
+            }
+            // GL origin is bottom-left; flip rows for a top-left PNG.
+            let row_bytes = w as usize * 4;
+            let mut flipped = vec![0u8; n];
+            for y in 0..h as usize {
+                let src = (h as usize - 1 - y) * row_bytes;
+                flipped[y * row_bytes..(y + 1) * row_bytes]
+                    .copy_from_slice(&buf[src..src + row_bytes]);
+            }
+            if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, flipped) {
+                let path = std::path::Path::new(&dir).join(format!("fb_{}x{}.png", w, h));
+                let _ = img.save(&path);
+                eprintln!("dump-fb wrote {}", path.display());
+            }
+        }
         gl.swap_buffers(surface)?;
 
         if !self.paused && !*awaiting_frame {

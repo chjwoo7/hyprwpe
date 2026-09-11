@@ -11,6 +11,9 @@ use hyprwpe_core::scene::{ObjectKind, Scene};
 use hyprwpe_core::tex::TexImage;
 use std::path::Path;
 
+use crate::scaling::Scaling;
+use crate::scene_transform::{canvas_map, clear_color, view_window, world_transforms, Affine};
+
 const VERTEX_SHADER_SOURCE: &str = r#"#version 300 es
 layout(location = 0) in vec2 aPosition;
 layout(location = 1) in vec2 aTexCoord;
@@ -131,6 +134,16 @@ impl Mat4 {
         m.0[5] = c;
         m
     }
+
+    /// A 4x4 for a 2D affine transform; z passes through unchanged.
+    pub fn from_affine(m: &Affine) -> Self {
+        Mat4([
+            m.a, m.b, 0.0, 0.0, //
+            m.c, m.d, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            m.e, m.f, 0.0, 1.0, //
+        ])
+    }
 }
 
 /// A rendered 2D image layer.
@@ -138,9 +151,9 @@ pub struct RenderLayer {
     pub texture: glow::Texture,
     pub width: f32,
     pub height: f32,
-    pub origin: [f32; 3],
-    pub scale: [f32; 3],
-    pub angles: [f32; 3],
+    /// The object's transform composed with every ancestor's (`parent` chains),
+    /// in design units. Children are positioned relative to their parent.
+    pub world: Affine,
     pub color: [f32; 4],
     pub visible: bool,
 }
@@ -157,8 +170,14 @@ pub struct ScenePlayer {
     /// Scene space the projection maps to the surface. `None` means "use the
     /// surface size" (the scene does not declare an orthogonal canvas).
     design: Option<(f32, f32)>,
-    /// Scene zoom applied on top of the aspect-fit projection.
+    /// Scene zoom applied on top of the projection (`general.zoom`).
     zoom: f32,
+    /// How the design canvas is fitted to the output, mirroring the mode the
+    /// user picked for this output (fill / fit / stretch / center).
+    scaling: Scaling,
+    /// Background painted behind the layers (`general.clearenabled` /
+    /// `clearcolor`). Undefined pixels behind a wallpaper are never acceptable.
+    clear: [f32; 4],
     is_paused: bool,
 }
 
@@ -174,7 +193,9 @@ impl ScenePlayer {
         }
     }
     /// Load a scene from a `scene.pkg` file or directory containing it.
-    pub fn new(path: &Path, gl: &glow::Context) -> Result<Self> {
+    ///
+    /// `scaling` is the output's fitting mode, applied to the design canvas.
+    pub fn new(path: &Path, gl: &glow::Context, scaling: Scaling) -> Result<Self> {
         let pkg_path = if path.is_dir() {
             path.join("scene.pkg")
         } else {
@@ -234,9 +255,10 @@ impl ScenePlayer {
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
 
+            let world = world_transforms(&scene.objects);
             let mut layers = Vec::new();
 
-            for obj in &scene.objects {
+            for (i, obj) in scene.objects.iter().enumerate() {
                 if obj.kind() != ObjectKind::Image {
                     continue;
                 }
@@ -265,9 +287,7 @@ impl ScenePlayer {
                         texture: tex_handle,
                         width: size[0],
                         height: size[1],
-                        origin: obj.origin(),
-                        scale: obj.scale(),
-                        angles: obj.angles(),
+                        world: world[i],
                         color,
                         visible: obj.is_visible(),
                     });
@@ -291,6 +311,8 @@ impl ScenePlayer {
                 layers,
                 design,
                 zoom,
+                scaling,
+                clear: clear_color(&scene),
                 is_paused: false,
             })
         }
@@ -309,26 +331,45 @@ impl ScenePlayer {
         unsafe {
             gl.viewport(0, 0, width, height);
 
+            // Paint the scene's declared background first. Layers may not cover
+            // the whole surface (a letterboxed or centre-scaled canvas, or a
+            // scene whose backdrop is smaller than the canvas), and undefined
+            // pixels behind a wallpaper are never acceptable.
+            gl.clear_color(self.clear[0], self.clear[1], self.clear[2], self.clear[3]);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+
             // Enable standard 2D alpha blending
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
 
             gl.use_program(Some(self.program));
 
-            // Projection: fit the scene's design canvas to the surface using
-            // COVER semantics (scale up until the canvas fills the output,
-            // cropping the overflow), matching how wallpaper engines present
-            // a non-matching aspect ratio. Letterboxing would show black bars,
-            // which reads as a broken wallpaper. Object origins are
-            // canvas-relative; the canvas is centred on the output.
-            let (dw, dh) = match self.design {
-                Some((w, h)) => (w, h),
-                None => (width as f32, height as f32),
-            };
-            let fit = (width as f32 / dw).max(height as f32 / dh) * self.zoom;
-            let ox = (width as f32 - dw * fit) / 2.0;
-            let oy = (height as f32 - dh * fit) / 2.0;
-            let proj = Mat4::ortho(ox, ox + dw * fit, oy, oy + dh * fit, -1000.0, 1000.0);
+            // Map the scene's design canvas onto the surface using this
+            // output's scaling mode (fill = cover, fit = letterbox, stretch,
+            // centre) — see `scene_transform::canvas_map`. Object origins are
+            // canvas-relative: (0, 0) is the canvas' bottom-left corner and +Y
+            // points up.
+            // Project the design-space window the output surface covers — not
+            // the canvas' own extent. When a mode like `Fill` makes the canvas
+            // overflow, the window is the visible middle of the canvas and the
+            // viewport crops it; projecting the canvas extent instead would
+            // leave the overflow margin unpainted. See `scene_transform::view_window`.
+            let map = canvas_map(
+                self.design,
+                self.zoom,
+                width as f32,
+                height as f32,
+                self.scaling,
+            );
+            let (left, right, bottom, top) = view_window(&map, width as f32, height as f32);
+            if std::env::var_os("HYPRWPE_DEBUG_SCENE").is_some() {
+                eprintln!(
+                    "scene-surface size={}x{} design={:?} zoom={} scaling={:?} map=({:.2},{:.2},{:.4},{:.4}) window=({:.1},{:.1},{:.1},{:.1})",
+                    width, height, self.design, self.zoom, self.scaling,
+                    map.x, map.y, map.sx, map.sy, left, right, bottom, top
+                );
+            }
+            let proj = Mat4::ortho(left, right, bottom, top, -1000.0, 1000.0);
             if let Some(loc) = &self.loc_projection {
                 gl.uniform_matrix_4_f32_slice(Some(loc), false, &proj.0);
             }
@@ -340,18 +381,14 @@ impl ScenePlayer {
                     continue;
                 }
 
-                // Quad is a unit square centred on the object origin: translate
-                // to origin -> rotate about the centre -> scale by half-extent
-                // (the quad spans -1..1, so the full width/height is size*scale).
-                let t = Mat4::translate(layer.origin[0], layer.origin[1], layer.origin[2]);
-                let r = Mat4::rotate_z(layer.angles[2].to_radians());
-                let s = Mat4::scale(
-                    layer.width * layer.scale[0] / 2.0,
-                    layer.height * layer.scale[1] / 2.0,
-                    1.0,
-                );
-
-                let model = t.mul(&r).mul(&s);
+                // The quad spans -1..1 around the object's origin; folding the
+                // half-extent into the composed transform makes the full quad
+                // exactly `size * scale` design units, centred on the origin and
+                // placed through every ancestor's transform.
+                let model = Mat4::from_affine(&layer.world.scale_linear(
+                    layer.width / 2.0,
+                    layer.height / 2.0,
+                ));
 
                 if let Some(loc) = &self.loc_model {
                     gl.uniform_matrix_4_f32_slice(Some(loc), false, &model.0);
@@ -484,8 +521,8 @@ fn resolve_texture_entry(pkg: &Package, material_path: &str, name: &str) -> Opti
         return pkg
             .get(&rooted)
             .is_some()
-            .then(|| rooted)
-            .or_else(|| pkg.get(&direct).is_some().then(|| direct));
+            .then_some(rooted)
+            .or_else(|| pkg.get(&direct).is_some().then_some(direct));
     }
     for ext in [".tex", ".png", ".jpg", ".jpeg", ".tga", ".bmp", ""] {
         let cand = format!("materials/{name}{ext}");

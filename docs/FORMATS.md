@@ -156,6 +156,30 @@ An object's kind is implied by which key it carries — `image`, `particle`,
 appearance keys (`origin`, `scale`, `angles`, `visible`, `parallaxDepth`,
 `alpha`, `color`, `effects`, `parent`) are shared across kinds.
 
+### Transform semantics (validated against the corpus)
+
+- `general.orthogonalprojection {width, height}` names the **design canvas**,
+  and object coordinates live in that space: `(0, 0)` is the canvas'
+  **bottom-left** corner and **+Y points up** (proved by scenes whose sky sits
+  at high Y and whose ground debris sits at negative Y).
+- An object's `origin` is the **centre of its quad** — proved by full-screen
+  objects that carry `size == canvas` and `origin == canvas centre`.
+- The quad spans `size * scale` design units. `size` is the quad's own extent,
+  not the texture's; for the 473 objects that rely on model `autosize` the two
+  agree in every observed case.
+- `parent` references another object's `id`; **405 of 1450 objects (28%)** use
+  it, and a child's transform is composed with its ancestors' — a child
+  `origin` is relative to the parent, in the parent's scaled and rotated frame.
+- The canvas is mapped onto the output with the output's scaling mode. The
+  **orthographic window is the design-space rectangle the output covers, not the
+  canvas' extent**: with `Fill` on a mismatched aspect the canvas overflows the
+  output, so only its visible middle is drawn and the viewport crops it.
+  Projecting the canvas' own extent instead leaves the overflow margin unpainted
+  and `clearcolor` shows through as bands. This was isolated by rendering a
+  synthetic scene (a canvas-sized background, red `clearcolor`) on a 16:10
+  output: a whole-canvas window left **29% of the frame bare**, the output-sized
+  window leaves none. `tools/mkscene.py` builds that scene.
+
 See [`SCENE-COVERAGE.md`](SCENE-COVERAGE.md) for how often each kind and effect
 appears, which is what drives the renderer's build order.
 

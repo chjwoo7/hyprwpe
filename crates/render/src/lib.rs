@@ -6,6 +6,7 @@ pub mod image_layer;
 pub mod mpv_dl;
 pub mod scaling;
 pub mod scene_layer;
+pub mod scene_transform;
 pub mod shader_layer;
 pub mod video_layer;
 

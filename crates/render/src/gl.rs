@@ -156,6 +156,22 @@ impl Renderer {
         })
     }
 
+    /// The size the EGL implementation actually gave the surface. On a
+    /// fractional-scale output this is the number that decides whether what we
+    /// render lands where the compositor expects it, so it is worth being able
+    /// to read back.
+    pub fn surface_egl_size(&self, surface: &GlSurface) -> Option<(i32, i32)> {
+        let w = self
+            .egl
+            .query_surface(self.display, surface.surface, egl::WIDTH)
+            .ok()?;
+        let h = self
+            .egl
+            .query_surface(self.display, surface.surface, egl::HEIGHT)
+            .ok()?;
+        Some((w, h))
+    }
+
     pub fn make_current(&self, surface: &GlSurface) -> Result<()> {
         self.egl
             .make_current(

@@ -99,9 +99,23 @@ path is implemented end to end.
   image object decoding (so they show their background rather than nothing).
 
 The layout model validated against real scenes: object `origin` is the quad
-centre, quad extent is `size * scale` in design units, and `general.
-orthogonalprojection {width,height}` names the design canvas that is
-aspect-fitted to the output surface.
+centre, quad extent is `size * scale` in design units, `general.
+orthogonalprojection {width,height}` names the design canvas, and object
+`parent` references compose into a world transform (405/1450 objects). The
+canvas is mapped onto the output with the **per-output scaling mode** the user
+chose (fill/fit/stretch/center), projecting the **design rectangle the output
+covers** rather than the canvas' extent, and `general.clearcolor` /
+`clearenabled` paints the background behind the layers. See
+[`FORMATS.md`](FORMATS.md#transform-semantics-validated-against-the-corpus) for
+the evidence behind each rule.
+
+Verification without a wallpaper: `tools/mkscene.py` builds a synthetic
+`scene.pkg` whose every object has a known position (a canvas-sized colour grid
+plus sized markers and a parented child), and
+`cargo run -p hyprwpe-render --example scenecompose -- <pkg> out.png W H [mode]`
+software-composites it through the *same* transform module the GPU renderer
+uses. A framing defect then shows up as a pixel in the wrong place, not a
+judgement call.
 
 **2. Particles.** 52/75 wallpapers. The largest single jump available.
 
