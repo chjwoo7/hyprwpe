@@ -142,6 +142,61 @@ impl Gl {
         }
     }
 
+    /// Compile both stages of a pass and link them into a program.
+    ///
+    /// Compiling is only half of what a render pass needs. Linking the stages
+    /// together is what catches an interface the vertex and fragment shaders
+    /// disagree about - a `varying` never written, a mismatched type - which no
+    /// single-stage compile can see.
+    fn link(&self, vert: &str, frag: &str) -> Result<(), String> {
+        unsafe {
+            let mut shaders = Vec::new();
+            for (kind, src, label) in [
+                (glow::VERTEX_SHADER, vert, "vertex"),
+                (glow::FRAGMENT_SHADER, frag, "fragment"),
+            ] {
+                let sh = self
+                    .gl
+                    .create_shader(kind)
+                    .map_err(|e| format!("create_shader({label}): {e}"))?;
+                self.gl.shader_source(sh, src);
+                self.gl.compile_shader(sh);
+                if !self.gl.get_shader_compile_status(sh) {
+                    let log = self.gl.get_shader_info_log(sh);
+                    for s in &shaders {
+                        self.gl.delete_shader(*s);
+                    }
+                    self.gl.delete_shader(sh);
+                    return Err(format!("{label}: {}", log.trim()));
+                }
+                shaders.push(sh);
+            }
+            let program = self
+                .gl
+                .create_program()
+                .map_err(|e| format!("create_program: {e}"))?;
+            for sh in &shaders {
+                self.gl.attach_shader(program, *sh);
+            }
+            // Our fragment output is a declared `out`, and its name is only
+            // meaningful if the binding is explicit.
+            self.gl.bind_frag_data_location(program, 0, "wp_FragColor");
+            self.gl.link_program(program);
+            let ok = self.gl.get_program_link_status(program);
+            let log = self.gl.get_program_info_log(program);
+            for sh in &shaders {
+                self.gl.detach_shader(program, *sh);
+                self.gl.delete_shader(*sh);
+            }
+            self.gl.delete_program(program);
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("link: {}", log.trim()))
+            }
+        }
+    }
+
     /// Compile one stage, returning the driver's log on failure.
     fn compile(&self, kind: u32, source: &str) -> Result<(), String> {
         unsafe {
@@ -198,6 +253,9 @@ fn main() {
     let mut effects: BTreeMap<String, (usize, Option<String>)> = BTreeMap::new();
     let mut stages_ok = 0usize;
     let mut stages_failed = 0usize;
+    let mut programs_attempted = 0usize;
+    let mut programs_linked = 0usize;
+    let mut programs_failed = 0usize;
 
     for dir in &dirs {
         let Ok(res) = Resources::open(&dir.join("scene.pkg")) else {
@@ -247,6 +305,11 @@ fn main() {
                         if pass.shader.is_empty() {
                             continue;
                         }
+                        // Build both stages, then link them: a render pass needs
+                        // a program, and linking is what catches an interface the
+                        // two stages disagree about.
+                        let mut built: Vec<(Stage, String)> = Vec::new();
+                        let mut stage_err: Option<String> = None;
                         for ext in ["frag", "vert"] {
                             let path = format!("shaders/{}.{ext}", pass.shader);
                             let Some(src) = res.get_str(&path) else {
@@ -262,8 +325,8 @@ fn main() {
                                 Ok(e) => e,
                                 Err(e) => {
                                     stages_failed += 1;
-                                    first_error = Some(format!("{path}: {e}"));
-                                    break 'mat;
+                                    stage_err = Some(format!("{path}: {e}"));
+                                    break;
                                 }
                             };
                             let assembled = effect::assemble(&expanded, stage, &[]);
@@ -273,7 +336,10 @@ fn main() {
                                 glow::VERTEX_SHADER
                             };
                             match gl.compile(kind, &assembled) {
-                                Ok(()) => stages_ok += 1,
+                                Ok(()) => {
+                                    stages_ok += 1;
+                                    built.push((stage, assembled));
+                                }
                                 Err(log) => {
                                     stages_failed += 1;
                                     if std::env::var_os("FXDUMP").is_some() {
@@ -282,37 +348,32 @@ fn main() {
                                         let _ = std::fs::write(&out, &assembled);
                                         eprintln!("dumped {out}");
                                     }
-                                    let src_lines: Vec<&str> = assembled.lines().collect();
-                                    let mut detail = String::new();
-                                    for l in log.lines() {
-                                        let l = l.trim();
-                                        if !l.contains("error") {
-                                            continue;
-                                        }
-                                        detail.push_str(&format!("\n    {l}"));
-                                        if let Some(rest) = l.strip_prefix("0(") {
-                                            if let Some(close) = rest.find(')') {
-                                                if let Ok(n) = rest[..close].trim().parse::<usize>()
-                                                {
-                                                    if let Some(src) =
-                                                        src_lines.get(n.saturating_sub(1))
-                                                    {
-                                                        detail.push_str(&format!(
-                                                            "\n      > {}",
-                                                            src.trim()
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if detail.lines().count() >= 12 {
-                                            break;
-                                        }
-                                    }
-                                    first_error = Some(format!("{path}:{detail}"));
-                                    break 'mat;
+                                    stage_err =
+                                        Some(format!("{path}:{}", error_lines(&log, &assembled)));
+                                    break;
                                 }
                             }
+                        }
+                        if let Some(e) = stage_err {
+                            first_error = Some(e);
+                            break 'mat;
+                        }
+                        let frag = built
+                            .iter()
+                            .find(|(s, _)| *s == Stage::Fragment)
+                            .map(|(_, src)| src.clone());
+                        let vert = built
+                            .iter()
+                            .find(|(s, _)| *s == Stage::Vertex)
+                            .map(|(_, src)| src.clone());
+                        if let (Some(frag), Some(vert)) = (frag, vert) {
+                            programs_attempted += 1;
+                            if let Err(e) = gl.link(&vert, &frag) {
+                                programs_failed += 1;
+                                first_error = Some(format!("shaders/{}: {e}", pass.shader));
+                                break 'mat;
+                            }
+                            programs_linked += 1;
                         }
                     }
                 }
@@ -331,6 +392,9 @@ fn main() {
     println!("shader stages compiled    : {stages_ok}");
     println!("shader stages failed      : {stages_failed}");
     println!(
+        "pass programs linked      : {programs_linked} of {programs_attempted} ({programs_failed} failed)"
+    );
+    println!(
         "effects with a broken stage: {} of {}",
         failed.len(),
         effects.len()
@@ -339,6 +403,32 @@ fn main() {
         println!("  {name} (used {uses}x)");
         println!("    {}", err.as_deref().unwrap_or("").trim());
     }
+}
+
+/// The driver's error lines, each followed by the source line it names.
+fn error_lines(log: &str, assembled: &str) -> String {
+    let src_lines: Vec<&str> = assembled.lines().collect();
+    let mut detail = String::new();
+    for l in log.lines() {
+        let l = l.trim();
+        if !l.contains("error") {
+            continue;
+        }
+        detail.push_str(&format!("\n    {l}"));
+        if let Some(rest) = l.strip_prefix("0(") {
+            if let Some(close) = rest.find(')') {
+                if let Ok(n) = rest[..close].trim().parse::<usize>() {
+                    if let Some(src) = src_lines.get(n.saturating_sub(1)) {
+                        detail.push_str(&format!("\n      > {}", src.trim()));
+                    }
+                }
+            }
+        }
+        if detail.lines().count() >= 12 {
+            break;
+        }
+    }
+    detail
 }
 
 fn expand(p: &str) -> String {
