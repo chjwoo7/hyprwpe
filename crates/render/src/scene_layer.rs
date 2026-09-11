@@ -297,6 +297,13 @@ pub struct RenderLayer {
     pub texture: glow::Texture,
     pub width: f32,
     pub height: f32,
+    /// The object's effect chains, in the order the engine applies them.
+    ///
+    /// One per effect file, because an object may stack several and each reads
+    /// the previous one's result. Built once at load: a chain owns a linked
+    /// program per pass and a pair of render targets, so rebuilding it per frame
+    /// would be both slow and wrong.
+    pub effects: Vec<crate::effect_pass::Chain>,
     /// The object's transform composed with every ancestor's (`parent` chains),
     /// in design units. Children are positioned relative to their parent. Used
     /// only when the scene has no animation; otherwise it is recomputed per
@@ -347,6 +354,13 @@ pub struct ScenePlayer {
     /// callbacks - gives up the cap entirely (they arrive at the panel's refresh
     /// rate, not ours).
     last_draw: std::time::Instant,
+    /// Whether effect chains run. Off makes the two paths directly comparable.
+    effects_enabled: bool,
+    /// How many objects carry an effect chain, for `describe`.
+    effect_count: usize,
+    /// An off-screen target at the output's size, reused by every effect pass.
+    /// One is enough because layers are drawn one at a time.
+    object_target: Option<(glow::Framebuffer, glow::Texture, i32, i32)>,
     is_paused: bool,
 }
 
@@ -440,6 +454,7 @@ impl ScenePlayer {
 
             let world = world_transforms(&scene.objects);
             let mut layers = Vec::new();
+            let mut effect_count = 0usize;
             let mut puppets = Vec::new();
             let mut particles = Vec::new();
 
@@ -529,10 +544,17 @@ impl ScenePlayer {
                         .map(|c| [c.x(), c.y(), c.z()])
                         .unwrap_or([1.0, 1.0, 1.0]);
 
+                    // An object's effects are a chain of shader passes over its
+                    // own render, so the chain is built here, once, where the
+                    // package and the object's values are both in hand.
+                    let effects = build_effect_chains(&pkg, gl, obj);
+                    effect_count += effects.iter().map(|c| c.len()).sum::<usize>();
+
                     layers.push(RenderLayer {
                         texture: tex_handle,
                         width: size[0],
                         height: size[1],
+                        effects,
                         world: world[i],
                         object_index: i,
                         color: color_rgb,
@@ -564,6 +586,9 @@ impl ScenePlayer {
                 animated,
                 start: std::time::Instant::now(),
                 last_draw: std::time::Instant::now(),
+                effects_enabled: true,
+                effect_count,
+                object_target: None,
                 is_paused: false,
             })
         }
@@ -590,6 +615,94 @@ impl ScenePlayer {
     /// Record that a frame was just drawn.
     pub fn mark_drawn(&mut self) {
         self.last_draw = std::time::Instant::now();
+    }
+
+    /// Turn effect chains on or off. With them off the renderer draws exactly
+    /// what it drew before they existed, which is what makes the two paths
+    /// comparable in a measurement.
+    pub fn set_effects_enabled(&mut self, enabled: bool) {
+        self.effects_enabled = enabled;
+    }
+
+    /// A short description of what this scene contains, for tools and logs.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} layers ({} with effects, {} effect passes), {} puppets, {} particle systems, design {:?}, zoom {}, scaling {:?}",
+            self.layers.len(),
+            self.layers.iter().filter(|l| !l.effects.is_empty()).count(),
+            self.effect_count,
+            self.puppets.len(),
+            self.particles.len(),
+            self.design,
+            self.zoom,
+            self.scaling,
+        )
+    }
+
+    /// The colour painted behind the layers, as `describe`'s companions need it
+    /// to tell covered pixels from bare ones.
+    pub fn clear_color(&self) -> [f32; 4] {
+        self.clear
+    }
+
+    /// The off-screen target effect passes render into, created on demand and
+    /// recreated when the output changes size.
+    ///
+    /// One target is enough for the whole scene because layers are drawn one at a
+    /// time, and it is reused across frames so a steady state allocates nothing.
+    fn object_target(
+        &mut self,
+        gl: &glow::Context,
+        width: i32,
+        height: i32,
+    ) -> Option<(glow::Framebuffer, glow::Texture)> {
+        if let Some((fbo, texture, w, h)) = self.object_target {
+            if w == width && h == height {
+                return Some((fbo, texture));
+            }
+            unsafe {
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(texture);
+            }
+            self.object_target = None;
+        }
+        unsafe {
+            let texture = gl.create_texture().ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                width,
+                height,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            let fbo = gl.create_framebuffer().ok()?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(texture),
+                0,
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.object_target = Some((fbo, texture, width, height));
+            Some((fbo, texture))
+        }
     }
 
     /// Render scene layers onto the viewport.
@@ -655,9 +768,25 @@ impl ScenePlayer {
                 Vec::new()
             };
 
-            for layer in &self.layers {
+            // `apply` needs each chain mutably while the loop also reads
+            // `self.objects`/`self.animations`, which the borrow checker will not
+            // allow through an indexed field. Taking the vector out and putting it
+            // back is a pointer swap, and nothing below can return early.
+            let mut layers = std::mem::take(&mut self.layers);
+            // Whatever framebuffer the caller had bound (the compositor's surface
+            // is `None`/0) has to be restored after an effect pass renders
+            // off-screen.
+            let bound_fbo = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) as u32;
+
+            for layer in layers.iter_mut() {
                 if !layer.visible {
                     continue;
+                }
+
+                // Re-established per layer, because an effect layer changes the
+                // projection for its own fullscreen composite.
+                if let Some(loc) = &self.loc_projection {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &proj.0);
                 }
 
                 let world = if self.animated {
@@ -695,9 +824,139 @@ impl ScenePlayer {
                     );
                 }
 
+                let alpha = if self.animated {
+                    animated_alpha(
+                        &self.objects[layer.object_index],
+                        &self.animations[layer.object_index],
+                        t,
+                    )
+                } else {
+                    self.objects[layer.object_index].alpha()
+                };
+
+                let debug_fx = std::env::var_os("HYPRWPE_DEBUG_FX").is_some();
+                if debug_fx {
+                    eprintln!(
+                        "fx: layer obj={} chain={:?} enabled={} bound_fbo={}",
+                        layer.object_index,
+                        layer.effects.len(),
+                        self.effects_enabled,
+                        bound_fbo
+                    );
+                }
+                if layer.effects.is_empty() || !self.effects_enabled {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
+                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    continue;
+                }
+
+                // Effect path: draw the object off-screen, run its chain, then
+                // composite the result. It is rendered at the output's size with
+                // the same projection, so a pass that reads screen coordinates
+                // sees what the engine would have given it.
+                let Some((object_fbo, object_texture)) = self.object_target(gl, width, height)
+                else {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
+                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    continue;
+                };
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(object_fbo));
+                gl.viewport(0, 0, width, height);
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+                if let Some(loc) = &self.loc_model {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &model.0);
+                }
+                if let Some(loc) = &self.loc_color {
+                    gl.uniform_4_f32(
+                        Some(loc),
+                        layer.color[0],
+                        layer.color[1],
+                        layer.color[2],
+                        alpha,
+                    );
+                }
                 gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+                // Each chain reads what the previous one produced, so the effect
+                // stack composes exactly as the engine's does.
+                let extra: Vec<Option<glow::Texture>> = vec![None; 8];
+                let mut produced: Result<glow::Texture> = Ok(object_texture);
+                for chain in layer.effects.iter_mut() {
+                    produced =
+                        produced.and_then(|src| chain.apply(gl, src, (width, height), &extra, t));
+                    if produced.is_err() {
+                        break;
+                    }
+                }
+                let result = produced;
+
+                // Restore everything the chain changed. A pass owns no state
+                // outside its own targets: it binds its own VAO and leaves none
+                // bound, sets its own blending, and unbinds the program - so the
+                // scene's drawing (this layer's composite, then puppets and
+                // particles) gets nothing drawn at all unless each is put back.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, restore(bound_fbo));
+                gl.viewport(0, 0, width, height);
+                gl.use_program(Some(self.program));
+                gl.bind_vertex_array(Some(self.vao));
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.disable(glow::DEPTH_TEST);
+                if let Some(loc) = &self.loc_projection {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &proj.0);
+                }
+                if let Some(loc) = &self.loc_model {
+                    gl.uniform_matrix_4_f32_slice(Some(loc), false, &model.0);
+                }
+                if let Some(loc) = &self.loc_color {
+                    gl.uniform_4_f32(
+                        Some(loc),
+                        layer.color[0],
+                        layer.color[1],
+                        layer.color[2],
+                        alpha,
+                    );
+                }
+
+                if debug_fx {
+                    eprintln!(
+                        "fx: apply -> {:?}",
+                        result.as_ref().map(|_| "ok").map_err(|e| format!("{e:#}"))
+                    );
+                }
+                match result {
+                    Ok(passed) => {
+                        // The chain's output is already in output space, so it
+                        // composites as a fullscreen quad: clip-space projection,
+                        // no model transform, no tint.
+                        if let Some(loc) = &self.loc_projection {
+                            let full = Mat4::ortho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
+                            gl.uniform_matrix_4_f32_slice(Some(loc), false, &full.0);
+                        }
+                        if let Some(loc) = &self.loc_model {
+                            gl.uniform_matrix_4_f32_slice(Some(loc), false, &Mat4::identity().0);
+                        }
+                        if let Some(loc) = &self.loc_color {
+                            gl.uniform_4_f32(Some(loc), 1.0, 1.0, 1.0, 1.0);
+                        }
+                        gl.bind_texture(glow::TEXTURE_2D, Some(passed));
+                        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    }
+                    Err(e) => {
+                        // A chain that fails mid-frame must not leave a hole:
+                        // draw the object plainly instead.
+                        eprintln!(
+                            "hyprwpe: effect chain for object {}: {e:#}",
+                            layer.object_index
+                        );
+                        gl.bind_texture(glow::TEXTURE_2D, Some(layer.texture));
+                        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    }
+                }
             }
+            self.layers = layers;
 
             // Puppets (skinned meshes). The pose is sampled for this instant, the
             // vertices are deformed on the CPU, and only the positions are
@@ -795,7 +1054,14 @@ impl ScenePlayer {
     pub fn destroy(self, gl: &glow::Context) {
         unsafe {
             for layer in self.layers {
+                for chain in &layer.effects {
+                    chain.destroy(gl);
+                }
                 gl.delete_texture(layer.texture);
+            }
+            if let Some((fbo, texture, _, _)) = self.object_target {
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(texture);
             }
             for p in self.puppets {
                 gl.delete_texture(p.texture);
@@ -809,6 +1075,51 @@ impl ScenePlayer {
             gl.delete_buffer(self.vbo);
         }
     }
+}
+
+/// The framebuffer a `DRAW_FRAMEBUFFER_BINDING` id refers to.
+///
+/// GL reports the bound framebuffer as an integer, and 0 means "the default
+/// one" - which `glow` spells `None`. Reconstructing it is how the renderer
+/// restores what the caller had bound after an off-screen pass.
+fn restore(id: u32) -> Option<glow::NativeFramebuffer> {
+    std::num::NonZeroU32::new(id).map(glow::NativeFramebuffer)
+}
+
+/// Build the effect chains an object names, in order.
+///
+/// One chain per effect file: an object may stack several effects, and the engine
+/// applies them in order, each reading the previous result. The values a chain
+/// resolves are the object's own per-pass overrides.
+fn build_effect_chains(
+    res: &Resources,
+    gl: &glow::Context,
+    obj: &SceneObject,
+) -> Vec<crate::effect_pass::Chain> {
+    let mut chains = Vec::new();
+    for effect in &obj.effects {
+        if !effect.visible.unwrap_or(true) {
+            continue;
+        }
+        let Some(file) = effect.file.as_ref() else {
+            continue;
+        };
+        let Some(body) = res.get_str(file) else {
+            eprintln!("hyprwpe: effect {file} is not in the package");
+            continue;
+        };
+        let values: Vec<Option<serde_json::Map<String, serde_json::Value>>> = effect
+            .passes
+            .iter()
+            .map(|p| p.constantshadervalues.clone())
+            .collect();
+        match crate::effect_pass::Chain::new(gl, res, &body, &values) {
+            Ok(chain) if !chain.is_empty() => chains.push(chain),
+            Ok(_) => {}
+            Err(e) => eprintln!("hyprwpe: effect {file}: {e:#}"),
+        }
+    }
+    chains
 }
 
 /// Resolve the actual texture bytes for a scene image object.

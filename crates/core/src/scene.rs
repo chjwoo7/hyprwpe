@@ -456,6 +456,23 @@ pub struct Effect {
     pub visible: Option<bool>,
     #[serde(default)]
     pub values: Option<serde_json::Value>,
+    /// Per-pass value overrides, in the effect's pass order.
+    ///
+    /// This is where an object's own effect settings live, keyed by the material
+    /// name each uniform's JSON comment names. The keys shadow the material's own
+    /// `constantshadervalues` and the comment's `default`; keeping them verbatim
+    /// means a value this crate does not model is still there for the shader.
+    #[serde(default)]
+    pub passes: Vec<EffectPass>,
+}
+
+/// One pass of an object's effect, with the values it was configured with.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EffectPass {
+    #[serde(default)]
+    pub id: Option<u32>,
+    #[serde(default)]
+    pub constantshadervalues: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// The inferred kind of a scene object based on which key it contains.
