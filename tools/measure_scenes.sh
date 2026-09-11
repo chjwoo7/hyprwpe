@@ -25,8 +25,10 @@ for dir in "$W"/*/; do
     pkg="$dir/scene.pkg"
     [ -f "$pkg" ] || continue
     # 480x270: enough to tell covered from bare, small enough to run them all.
-    # `--json` is one object per line, so a corpus run is a data file.
-    json="$("$BIN" "$pkg" /dev/null 480 270 fill --json 2>/dev/null | tail -1)"
+    # `--json` is one object per line, so a corpus run is a data file. `--time 6`
+    # matters: at t=0 particles have not spawned and animation is at its first
+    # keyframe, so a scene is measured as blank when it is merely waiting.
+    json="$("$BIN" "$pkg" /dev/null 480 270 fill --time 6 --json 2>/dev/null | tail -1)"
     if [ -z "$json" ]; then
         printf '%s\tfailed\t\n' "$id" >> "$OUT"
         continue

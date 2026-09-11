@@ -40,6 +40,15 @@ fn main() {
         .unwrap_or(Scaling::Fill);
     let effects = !args.iter().any(|a| a == "--no-effects");
     let json_out = args.iter().any(|a| a == "--json");
+    // A scene at t=0 is not representative: particles have not spawned yet and
+    // animation is at its first keyframe, so a corpus measured at zero would
+    // report a wallpaper as blank when it is simply waiting to start.
+    let at_time: f32 = args
+        .iter()
+        .position(|a| a == "--time")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
 
     // `--set key=value` applies a wallpaper setting, so a property change can be
     // followed all the way to pixels: property -> effect uniform -> framebuffer.
@@ -151,6 +160,7 @@ fn main() {
         }
     };
     player.set_effects_enabled(effects);
+    player.advance_to(at_time);
     let info = player.describe();
     if !json_out {
         println!("scene: {info}");

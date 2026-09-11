@@ -288,8 +288,13 @@ struct ParticleLayer {
     /// Sprites for the current frame, reused so a frame allocates nothing once
     /// the population has settled.
     sprites: Vec<crate::particle::Sprite>,
-    /// Last time `step` was called, so `dt` is measured rather than assumed.
-    last: std::time::Instant,
+    /// The scene-clock time this simulation has been advanced to.
+    ///
+    /// Stepping on `Instant::now()` deltas made a fixed-time render spawn
+    /// nothing: one frame advances the sim by ~0s. Tracking the scene clock
+    /// instead means the same code is right for a live daemon (the clock is
+    /// monotonic) and for a headless render at an arbitrary time.
+    sim_time: f32,
 }
 
 /// A rendered 2D image layer.
@@ -596,6 +601,26 @@ impl ScenePlayer {
 
     pub fn set_paused(&mut self, paused: bool) {
         self.is_paused = paused;
+    }
+
+    /// Move the scene's clock to `t` seconds, so a render taken next reflects a
+    /// moment that is not the very start.
+    ///
+    /// Particle systems spawn on a schedule and animations begin at their first
+    /// keyframe, so a frame at t=0 understates a scene: measuring a library at
+    /// zero would call a working wallpaper blank.
+    pub fn advance_to(&mut self, t: f32) {
+        let t = t.max(0.0);
+        self.start = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs_f32(t))
+            .unwrap_or_else(std::time::Instant::now);
+        // Bring the simulations to that moment in the simulator's own fixed
+        // steps, so a render at an arbitrary time shows a settled population
+        // rather than one that has existed for a single frame.
+        for p in &mut self.particles {
+            p.sprites = p.sim.advance_to(t);
+            p.sim_time = t;
+        }
     }
 
     /// Whether a frame is due, given an optional cap.
@@ -1018,11 +1043,13 @@ impl ScenePlayer {
                     if !p.visible {
                         continue;
                     }
-                    let now = std::time::Instant::now();
-                    let dt = now.duration_since(p.last).as_secs_f32();
-                    p.last = now;
+                    // Advance on the scene clock, not the wall clock. Stepping on
+                    // `Instant` deltas meant a headless render at a fixed time
+                    // advanced the sim by ~0s and spawned nothing, however long
+                    // the scene had "been running".
+                    let dt = (t - p.sim_time).clamp(0.0, 0.1);
+                    p.sim_time = t;
                     p.sprites = p.sim.step(dt);
-
                     let placement = if self.animated {
                         animated_world[p.object_index]
                     } else {
@@ -1278,7 +1305,7 @@ unsafe fn load_particle_layers(
             object_index,
             visible,
             sprites: Vec::new(),
-            last: std::time::Instant::now(),
+            sim_time: 0.0,
         });
     }
     out
