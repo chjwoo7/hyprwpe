@@ -533,6 +533,17 @@ impl ScenePlayer {
 
                 let texture_file = resolve_texture_file(&pkg, &mat_path);
                 let Some(tex_name) = texture_file else {
+                    // Silent by default, because most packages reference engine
+                    // assets that only exist on a machine with Wallpaper Engine
+                    // installed. The diagnostic names the object so a genuinely
+                    // broken chain can be told from an absent optional asset.
+                    if std::env::var_os("HYPRWPE_DEBUG_LAYERS").is_some() {
+                        eprintln!(
+                            "  layer obj {i} {:?}: no texture resolved from {:?}",
+                            obj.name.as_deref().unwrap_or("?"),
+                            mat_path
+                        );
+                    }
                     continue;
                 };
 

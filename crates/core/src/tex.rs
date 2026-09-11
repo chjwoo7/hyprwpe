@@ -37,6 +37,23 @@ pub enum TexFormat {
 }
 
 impl TexFormat {
+    /// Bytes one mip level occupies, when the format states it.
+    ///
+    /// A texture may carry a mip chain after level 0. Only level 0 is decoded,
+    /// so callers trim to this length - otherwise the chain rides along as if it
+    /// were image data.
+    pub fn level_bytes(&self, width: u32, height: u32) -> Option<usize> {
+        let (w, h) = (width as usize, height as usize);
+        Some(match self {
+            TexFormat::Rgba8 => w * h * 4,
+            TexFormat::Rgb8 => w * h * 3,
+            TexFormat::R8 => w * h,
+            TexFormat::Dxt1 => w.div_ceil(4) * h.div_ceil(4) * 8,
+            TexFormat::Dxt3 | TexFormat::Dxt5 => w.div_ceil(4) * h.div_ceil(4) * 16,
+            _ => return None,
+        })
+    }
+
     pub fn from_u32(val: u32) -> Self {
         match val {
             0 | 1 | 28 => TexFormat::Rgba8,
@@ -210,11 +227,18 @@ impl TexImage {
         // keep the one whose payload length exactly matches a known format.
         let (width, height, data_start, format) = dims_from_payload(bytes)?;
 
+        // Level 0 only: a mip chain after it is not image data.
+        let tail = &bytes[data_start..];
+        let data = match format.level_bytes(width, height) {
+            Some(n) if n <= tail.len() => tail[..n].to_vec(),
+            _ => tail.to_vec(),
+        };
+
         Ok(TexImage {
             width,
             height,
             format,
-            data: bytes[data_start..].to_vec(),
+            data,
         })
     }
 
@@ -341,6 +365,33 @@ fn dims_from_payload(bytes: &[u8]) -> Result<(u32, u32, usize, TexFormat)> {
     let Some(tb) = find_texb(bytes) else {
         bail!("TEXV0005 with no TEXB payload");
     };
+
+    // `TEXB0001` states its own layout (see `parse_asset_texb` for the evidence):
+    // format word, flags word, then width / height / raw size as plain `u32`,
+    // then pixels. Preferred over searching because the invariant
+    // `size == w * h * 4` holds for every such file, and because mips make the
+    // remaining bytes exceed one level - which defeats an exact-match search.
+    if bytes.get(tb + 4..tb + 8) == Some(b"0001") {
+        let field = |off: usize| -> Option<u32> {
+            bytes
+                .get(tb + off..tb + off + 4)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        };
+        if let (Some(fmt), Some(w), Some(h), Some(size)) =
+            (field(9), field(17), field(21), field(25))
+        {
+            let size = size as usize;
+            let start = tb + 29;
+            if fmt == 1
+                && w > 0
+                && h > 0
+                && size == (w as usize) * (h as usize) * 4
+                && start + size <= bytes.len()
+            {
+                return Ok((w, h, start, TexFormat::Rgba8));
+            }
+        }
+    }
     // Search the header region after the TEXB magic for (w, h) candidates.
     let header_end = (tb + 8 + 96).min(bytes.len());
 
@@ -437,6 +488,47 @@ fn parse_asset_texb(bytes: &[u8], format: TexFormat) -> Option<TexImage> {
         return None;
     }
     let tb = find_texb(bytes)?;
+
+    // `TEXB0001` states its own layout, and does so consistently across all 42
+    // engine textures that use it: after the magic, a format word (1 =
+    // rgba8888), a flags word, then width / height / raw size as plain `u32`,
+    // then the pixels. The invariant `size == width * height * 4` holds for
+    // every one of them, so this is the file telling us where its pixels are
+    // rather than a guess - and it is the only reliable path for these files,
+    // because a mip chain makes the remaining bytes exceed one level, which
+    // defeats an exact-match search.
+    if bytes.get(tb + 4..tb + 8) == Some(b"0001") {
+        let u32at = |o: usize| -> Option<u32> {
+            let s = bytes.get(o..o + 4)?;
+            Some(u32::from_le_bytes(s.try_into().ok()?))
+        };
+        let (fmt, width, height, size) = (
+            u32at(tb + 9)?,
+            u32at(tb + 17)?,
+            u32at(tb + 21)?,
+            u32at(tb + 25)? as usize,
+        );
+        let start = tb + 29;
+        // Format 1 is the 32-bit RGBA these previewers and `util/*` use.
+        let matches_rgba = fmt == 1 && size == (width as usize) * (height as usize) * 4;
+        if matches_rgba
+            && width > 0
+            && height > 0
+            && width <= 16384
+            && height <= 16384
+            && start + size <= bytes.len()
+            && matches!(format, TexFormat::Rgba8)
+        {
+            return Some(TexImage {
+                width,
+                height,
+                format,
+                // The first level only: any mips that follow are not used.
+                data: bytes[start..start + size].to_vec(),
+            });
+        }
+    }
+
     let u32at = |o: usize| -> Option<u32> {
         let s = bytes.get(o..o + 4)?;
         Some(u32::from_le_bytes(s.try_into().ok()?))
@@ -753,6 +845,46 @@ mod tests {
 
         let rgba = tex.to_rgba8().expect("decodes to rgba");
         assert_eq!(rgba, pixel_data);
+    }
+
+    /// Regression: `TEXB0001` is the revision the engine uses for its own
+    /// `util/*` textures and effect previews. Its pixels sit at a stated offset
+    /// and its size is `width * height * 4`, so a file carrying a mip chain must
+    /// still decode - a search for one exact level's worth of bytes finds
+    /// nothing when mips make the remainder longer. These textures back the
+    /// solid/instance layers, so failing to decode them silently drops layers.
+    #[test]
+    fn parse_texb0001_raw_rgba_with_mips() {
+        let (w, h) = (2u32, 2u32);
+        let level0 = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+
+        let mut texb = Vec::new();
+        texb.extend_from_slice(b"TEXB0001");
+        texb.push(0); // Padding byte, then the header fields
+        texb.extend_from_slice(&1u32.to_le_bytes()); // Format: Rgba8
+        texb.extend_from_slice(&1u32.to_le_bytes()); // Flags
+        texb.extend_from_slice(&w.to_le_bytes());
+        texb.extend_from_slice(&h.to_le_bytes());
+        texb.extend_from_slice(&(w * h * 4).to_le_bytes()); // Raw size, level 0
+        texb.extend_from_slice(&level0);
+        texb.extend_from_slice(&[0u8; 5]); // A mip level after level 0
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TEXV0005\x00");
+        bytes.extend_from_slice(b"TEXI0001");
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&texb);
+
+        let tex = TexImage::parse_with_sidecar(&bytes, None).expect("valid texb0001");
+        assert_eq!((tex.width, tex.height), (w, h));
+        assert_eq!(tex.format, TexFormat::Rgba8);
+        assert_eq!(
+            tex.data, level0,
+            "level 0 only; the mip tail is not part of the image"
+        );
+        assert_eq!(tex.to_rgba8().expect("decodes to rgba"), level0);
     }
 
     #[test]

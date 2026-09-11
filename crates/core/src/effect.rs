@@ -368,7 +368,20 @@ pub fn assemble(source: &str, stage: Stage, defines: &[String]) -> String {
     // Both stages: a vertex shader's include may sample just as a fragment
     // shader's does (`blend.vert` reads `g_Texture1Resolution`).
     out.push_str(&texture_uniform_block());
+    // A combo default must not collide with a define the caller supplied: the
+    // material and the scene select combos by name, and `#define`-ing a name
+    // that is already defined is a redefinition error ("Macro VERTICAL
+    // redefined"), which silently costs the whole pass.
+    let provided: std::collections::HashSet<&str> =
+        defines.iter().filter_map(|d| d.split('=').next()).collect();
     for d in combo_defines(&body) {
+        let name = d
+            .lines()
+            .find_map(|l| l.strip_prefix("#ifndef "))
+            .unwrap_or_default();
+        if provided.contains(name) {
+            continue;
+        }
         out.push_str(&d);
         out.push('\n');
     }
@@ -518,6 +531,38 @@ uniform mat4 g_ModelViewProjectionMatrix;
         };
         // Each file is included once, so the cycle stops rather than recursing.
         assert!(expand_includes("#include \"a.h\"\n", &files).is_ok());
+    }
+
+    /// Regression: a scene or material can select a combo by name, and the
+    /// assembled source also defaults every combo it sees. Emitting both makes
+    /// the second a redefinition ("Macro VERTICAL redefined"), which costs the
+    /// whole pass silently.
+    #[test]
+    fn a_supplied_define_is_not_also_defaulted() {
+        let out = assemble(
+            "#if VERTICAL\nfloat dir = 1.0;\n#else\nfloat dir = 0.0;\n#endif\nvoid main(){}",
+            Stage::Fragment,
+            &["VERTICAL=1".to_string()],
+        );
+        assert_eq!(
+            out.matches("VERTICAL").count(),
+            // one in the `#if`, one in the explicit `#define`
+            2,
+            "exactly one definition and the test that reads it:\n{out}"
+        );
+        assert!(
+            !out.contains("#ifndef VERTICAL"),
+            "no default for a name the caller supplied:\n{out}"
+        );
+        assert!(out.contains("#define VERTICAL=1"));
+        // A combo the caller did *not* name is still defaulted, or the `#if`
+        // would not compile.
+        let out = assemble(
+            "#if VERTICAL\n#endif\n#if NOISE\n#endif\nvoid main(){}",
+            Stage::Fragment,
+            &["VERTICAL=1".to_string()],
+        );
+        assert!(out.contains("#ifndef NOISE"), "{out}");
     }
 
     /// The bug that kept every `lightshafts`-family effect failing: a name the
