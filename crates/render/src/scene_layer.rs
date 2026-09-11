@@ -12,7 +12,13 @@ use hyprwpe_core::tex::TexImage;
 use std::path::Path;
 
 use crate::scaling::Scaling;
-use crate::scene_transform::{canvas_map, clear_color, view_window, world_transforms, Affine};
+use crate::scene_transform::{
+    animated_alpha, animated_world_transforms, canvas_map, clear_color, view_window,
+    world_transforms, Affine,
+};
+use hyprwpe_core::animation::Animation;
+use hyprwpe_core::scene::SceneObject;
+use std::collections::HashMap;
 
 const VERTEX_SHADER_SOURCE: &str = r#"#version 300 es
 layout(location = 0) in vec2 aPosition;
@@ -152,9 +158,15 @@ pub struct RenderLayer {
     pub width: f32,
     pub height: f32,
     /// The object's transform composed with every ancestor's (`parent` chains),
-    /// in design units. Children are positioned relative to their parent.
+    /// in design units. Children are positioned relative to their parent. Used
+    /// only when the scene has no animation; otherwise it is recomputed per
+    /// frame so animated properties (and animated ancestors) take effect.
     pub world: Affine,
-    pub color: [f32; 4],
+    /// Index of the source object, so an animated property can be looked up.
+    pub object_index: usize,
+    /// Base colour; the alpha component comes from the object (or its
+    /// animation) each frame.
+    pub color: [f32; 3],
     pub visible: bool,
 }
 
@@ -178,6 +190,14 @@ pub struct ScenePlayer {
     /// Background painted behind the layers (`general.clearenabled` /
     /// `clearcolor`). Undefined pixels behind a wallpaper are never acceptable.
     clear: [f32; 4],
+    /// The scene graph and its property animations, kept so animated transforms
+    /// can be evaluated per frame.
+    objects: Vec<SceneObject>,
+    animations: Vec<HashMap<String, Animation>>,
+    /// Whether any object animates; when false the loop skips recomputation.
+    animated: bool,
+    /// Clock origin for animation time.
+    start: std::time::Instant,
     is_paused: bool,
 }
 
@@ -280,15 +300,14 @@ impl ScenePlayer {
                     }
 
                     let color_rgb = obj.color.map(|c| [c.x(), c.y(), c.z()]).unwrap_or([1.0, 1.0, 1.0]);
-                    let alpha = obj.alpha();
-                    let color = [color_rgb[0], color_rgb[1], color_rgb[2], alpha];
 
                     layers.push(RenderLayer {
                         texture: tex_handle,
                         width: size[0],
                         height: size[1],
                         world: world[i],
-                        color,
+                        object_index: i,
+                        color: color_rgb,
                         visible: obj.is_visible(),
                     });
                 }
@@ -300,6 +319,7 @@ impl ScenePlayer {
                 .as_ref()
                 .and_then(|g| g.zoom)
                 .unwrap_or(1.0);
+            let animated = scene.animations.iter().any(|m| !m.is_empty());
 
             Ok(ScenePlayer {
                 program,
@@ -313,6 +333,10 @@ impl ScenePlayer {
                 zoom,
                 scaling,
                 clear: clear_color(&scene),
+                objects: scene.objects.clone(),
+                animations: scene.animations.clone(),
+                animated,
+                start: std::time::Instant::now(),
                 is_paused: false,
             })
         }
@@ -376,30 +400,53 @@ impl ScenePlayer {
 
             gl.bind_vertex_array(Some(self.vao));
 
+            // Animated properties are evaluated on the render clock; a scene
+            // with no animation reuses the transform computed at load.
+            let t = self.start.elapsed().as_secs_f32();
+            let animated_world = if self.animated {
+                animated_world_transforms(&self.objects, &self.animations, t)
+            } else {
+                Vec::new()
+            };
+
             for layer in &self.layers {
                 if !layer.visible {
                     continue;
                 }
 
+                let world = if self.animated {
+                    animated_world[layer.object_index]
+                } else {
+                    layer.world
+                };
+
                 // The quad spans -1..1 around the object's origin; folding the
                 // half-extent into the composed transform makes the full quad
                 // exactly `size * scale` design units, centred on the origin and
                 // placed through every ancestor's transform.
-                let model = Mat4::from_affine(&layer.world.scale_linear(
-                    layer.width / 2.0,
-                    layer.height / 2.0,
-                ));
+                let model = Mat4::from_affine(
+                    &world.scale_linear(layer.width / 2.0, layer.height / 2.0),
+                );
 
                 if let Some(loc) = &self.loc_model {
                     gl.uniform_matrix_4_f32_slice(Some(loc), false, &model.0);
                 }
                 if let Some(loc) = &self.loc_color {
+                    let alpha = if self.animated {
+                        animated_alpha(
+                            &self.objects[layer.object_index],
+                            &self.animations[layer.object_index],
+                            t,
+                        )
+                    } else {
+                        self.objects[layer.object_index].alpha()
+                    };
                     gl.uniform_4_f32(
                         Some(loc),
                         layer.color[0],
                         layer.color[1],
                         layer.color[2],
-                        layer.color[3],
+                        alpha,
                     );
                 }
 

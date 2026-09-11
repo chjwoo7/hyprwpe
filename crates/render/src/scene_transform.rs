@@ -15,6 +15,7 @@
 //! compositing harness.
 
 use crate::scaling::Scaling;
+use hyprwpe_core::animation::Animation;
 use hyprwpe_core::scene::{Scene, SceneObject};
 use std::collections::HashMap;
 
@@ -138,22 +139,80 @@ pub fn local_transform(obj: &SceneObject) -> Affine {
         .mul(&Affine::scale(scale[0], scale[1]))
 }
 
+/// The object's own transform with its animated properties applied at `t`
+/// seconds. A property without an animation falls back to its base value.
+pub fn animated_local(
+    obj: &SceneObject,
+    animations: &HashMap<String, Animation>,
+    t: f32,
+) -> Affine {
+    let origin = anim_vec3(animations, "origin", t).unwrap_or_else(|| obj.origin());
+    let scale = anim_vec3(animations, "scale", t).unwrap_or_else(|| obj.scale());
+    let angles = anim_vec3(animations, "angles", t).unwrap_or_else(|| obj.angles());
+    Affine::translate(origin[0], origin[1])
+        .mul(&Affine::rotate(angles[2].to_radians()))
+        .mul(&Affine::scale(scale[0], scale[1]))
+}
+
+fn anim_vec3(animations: &HashMap<String, Animation>, key: &str, t: f32) -> Option<[f32; 3]> {
+    animations.get(key).and_then(|a| a.sample_vec3(t))
+}
+
+/// The object's alpha with its animation applied at `t` seconds.
+pub fn animated_alpha(obj: &SceneObject, animations: &HashMap<String, Animation>, t: f32) -> f32 {
+    animations
+        .get("alpha")
+        .and_then(|a| a.sample(t))
+        .unwrap_or_else(|| obj.alpha())
+}
+
+/// World transform of every object at `t` seconds, composing `parent` chains and
+/// applying each object's property animations.
+pub fn animated_world_transforms(
+    objects: &[SceneObject],
+    animations: &[HashMap<String, Animation>],
+    t: f32,
+) -> Vec<Affine> {
+    let index = index_by_id(objects);
+    let local = |i: usize| {
+        let anims = animations.get(i);
+        match anims {
+            Some(a) => animated_local(&objects[i], a, t),
+            None => local_transform(&objects[i]),
+        }
+    };
+    compose(objects, &index, &local)
+}
+
 /// World transform of every object, composing `parent` chains.
 ///
 /// A missing or self-referential parent falls back to the object's local
 /// transform, and a cycle is broken rather than recursed into: a malformed
 /// package must degrade to a wrong-looking layer, never to a hang.
 pub fn world_transforms(objects: &[SceneObject]) -> Vec<Affine> {
+    let index = index_by_id(objects);
+    let local = |i: usize| local_transform(&objects[i]);
+    compose(objects, &index, &local)
+}
+
+fn index_by_id(objects: &[SceneObject]) -> HashMap<u32, usize> {
     let mut index: HashMap<u32, usize> = HashMap::new();
     for (i, obj) in objects.iter().enumerate() {
         if let Some(id) = obj.id {
             index.entry(id).or_insert(i);
         }
     }
+    index
+}
 
+fn compose(
+    objects: &[SceneObject],
+    index: &HashMap<u32, usize>,
+    local: &dyn Fn(usize) -> Affine,
+) -> Vec<Affine> {
     let mut out = vec![Affine::IDENTITY; objects.len()];
     for (i, slot) in out.iter_mut().enumerate() {
-        *slot = world_of(i, objects, &index, &mut Vec::new());
+        *slot = world_of(i, objects, index, local, &mut Vec::new());
     }
     out
 }
@@ -162,17 +221,16 @@ fn world_of(
     i: usize,
     objects: &[SceneObject],
     index: &HashMap<u32, usize>,
+    local: &dyn Fn(usize) -> Affine,
     stack: &mut Vec<usize>,
 ) -> Affine {
     if stack.contains(&i) {
         return Affine::IDENTITY;
     }
     stack.push(i);
-    let obj = &objects[i];
-    let local = local_transform(obj);
-    let world = match obj.parent.and_then(|p| index.get(&p).copied()) {
-        Some(pi) if pi != i => world_of(pi, objects, index, stack).mul(&local),
-        _ => local,
+    let world = match objects[i].parent.and_then(|p| index.get(&p).copied()) {
+        Some(pi) if pi != i => world_of(pi, objects, index, local, stack).mul(&local(i)),
+        _ => local(i),
     };
     stack.pop();
     world

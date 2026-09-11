@@ -13,7 +13,9 @@ use hyprwpe_core::pkg::Package;
 use hyprwpe_core::scene::{ObjectKind, Scene};
 use hyprwpe_core::tex::TexImage;
 use hyprwpe_render::scaling::Scaling;
-use hyprwpe_render::scene_transform::{canvas_map, clear_color, world_transforms, Affine};
+use hyprwpe_render::scene_transform::{
+    animated_alpha, animated_world_transforms, canvas_map, clear_color, Affine,
+};
 use image::{Rgba, RgbaImage};
 
 fn is_image_file(path: &str) -> bool {
@@ -128,6 +130,13 @@ fn main() {
         .get(5)
         .and_then(|a| Scaling::parse(a))
         .unwrap_or(Scaling::Fill);
+    // Optional time (seconds) at which to sample property animations; lets a
+    // single scene be rendered at several frames and compared.
+    let t: f32 = args
+        .get(6)
+        .and_then(|a| a.parse().ok())
+        .or_else(|| std::env::var("HYPRWPE_TIME").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0);
 
     let pkg = Package::open(std::path::Path::new(pkg_path)).expect("open pkg");
     let scene_json = pkg.get_str("scene.json").expect("scene.json");
@@ -153,7 +162,7 @@ fn main() {
     let map = canvas_map(design, zoom, out_w as f32, out_h as f32, scaling);
     println!("design {design:?} zoom {zoom} scaling {scaling:?} -> map {map:?}");
 
-    let world = world_transforms(&scene.objects);
+    let world = animated_world_transforms(&scene.objects, &scene.animations, t);
     let mut layers: Vec<Layer> = Vec::new();
     for (i, obj) in scene.objects.iter().enumerate() {
         if obj.kind() != ObjectKind::Image || !obj.is_visible() {
@@ -185,7 +194,8 @@ fn main() {
             .color
             .map(|c| [c.x(), c.y(), c.z()])
             .unwrap_or([1.0, 1.0, 1.0]);
-        let alpha = obj.alpha();
+        let anims = scene.animations.get(i).cloned().unwrap_or_default();
+        let alpha = animated_alpha(obj, &anims, t);
 
         layers.push(Layer {
             img,

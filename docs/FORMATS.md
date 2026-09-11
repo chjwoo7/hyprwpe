@@ -180,8 +180,36 @@ appearance keys (`origin`, `scale`, `angles`, `visible`, `parallaxDepth`,
   output: a whole-canvas window left **29% of the frame bare**, the output-sized
   window leaves none. `tools/mkscene.py` builds that scene.
 
-See [`SCENE-COVERAGE.md`](SCENE-COVERAGE.md) for how often each kind and effect
-appears, which is what drives the renderer's build order.
+## Property animation
+
+Six of the 75 local scenes animate an object *property* rather than the mesh.
+An animatable property may be a bare value (`"alpha": 1`) or an object carrying
+both a base value and its keyframes:
+
+```json
+"origin": { "value": "400 400 0", "animation": {
+    "c0": [ {"frame": 0, "value": 400}, {"frame": 60, "value": 3400} ],
+    "c1": [ {"frame": 0, "value": 400}, {"frame": 60, "value": 1800} ],
+    "options": { "fps": 30, "length": 120, "mode": "loop" }
+} }
+```
+
+`c0`/`c1`/`c2` are one track per component (scalars use `c0` only, vectors use
+three). `options.mode` is `single` (hold the last value), `loop` (wrap) or
+`mirror` (ping-pong); timing is `frame / fps` with linear interpolation between
+keys, and `options.length` defaults to the last keyframe. Animatable properties
+seen in the corpus: `origin` (10 objects), `alpha` (10), `angles` (4), `scale`
+(4), `light.intensity` (1).
+
+`startpaused` animations (a media-play icon, say) only advance when a scene
+*script* triggers them; hyprwpe has no scene scripting, so it holds the first
+frame rather than inventing motion.
+
+**Puppet models.** A `models/*.json` may name a `"puppet": "…_puppet.mdl"`
+next to its `material`; 12 of 75 scenes reference one. Those MDLV0023 files carry
+a deforming mesh (sections `MDLS####` skeleton, `MDLA####` animation) and drive
+character motion — **not yet implemented**; such a model currently renders as its
+static material texture.
 
 ## `.tex` textures — confirmed
 

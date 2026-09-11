@@ -96,23 +96,28 @@ impl<'de> Deserialize<'de> for Vec3 {
             where
                 M: de::MapAccess<'de>,
             {
+                // Consume EVERY entry: a property may carry both `value` and
+                // `animation`, and returning as soon as `value` was seen would
+                // abandon the rest of the map (serde then reports a "trailing
+                // comma"). Later keys simply overwrite earlier ones.
                 let mut res = Vec3::default();
                 while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
-                    if k == "value" {
-                        if let Some(s) = v.as_str() {
-                            return self.visit_str(s);
-                        } else if let Some(arr) = v.as_array() {
-                            let x = arr.first().and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                            let y = arr.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                            let z = arr.get(2).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                            return Ok(Vec3([x, y, z]));
+                    match k.as_str() {
+                        "value" => {
+                            if let Some(s) = v.as_str() {
+                                res = parse_vec3_str(s);
+                            } else if let Some(arr) = v.as_array() {
+                                res = Vec3([
+                                    arr.first().and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                                    arr.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                                    arr.get(2).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                                ]);
+                            }
                         }
-                    } else if k == "x" {
-                        res.0[0] = v.as_f64().unwrap_or(0.0) as f32;
-                    } else if k == "y" {
-                        res.0[1] = v.as_f64().unwrap_or(0.0) as f32;
-                    } else if k == "z" {
-                        res.0[2] = v.as_f64().unwrap_or(0.0) as f32;
+                        "x" => res.0[0] = v.as_f64().unwrap_or(0.0) as f32,
+                        "y" => res.0[1] = v.as_f64().unwrap_or(0.0) as f32,
+                        "z" => res.0[2] = v.as_f64().unwrap_or(0.0) as f32,
+                        _ => {}
                     }
                 }
                 Ok(res)
@@ -120,6 +125,20 @@ impl<'de> Deserialize<'de> for Vec3 {
         }
         deserializer.deserialize_any(Vec3Visitor)
     }
+}
+
+/// Parse a `"x y z"` (or `"x,y,z"`) vector string; missing parts are zero.
+fn parse_vec3_str(v: &str) -> Vec3 {
+    let nums: Vec<f32> = v
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    Vec3([
+        nums.first().copied().unwrap_or(0.0),
+        nums.get(1).copied().unwrap_or(0.0),
+        nums.get(2).copied().unwrap_or(0.0),
+    ])
 }
 
 /// A 2D vector supporting both array (`[x, y]`) and string (`"x y"`) serialization.
@@ -203,20 +222,24 @@ impl<'de> Deserialize<'de> for Vec2 {
             where
                 M: de::MapAccess<'de>,
             {
+                // See `Vec3`: every entry must be consumed, because a property
+                // can carry `value` and `animation` together.
                 let mut res = Vec2::default();
                 while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
-                    if k == "value" {
-                        if let Some(s) = v.as_str() {
-                            return self.visit_str(s);
-                        } else if let Some(arr) = v.as_array() {
-                            let x = arr.first().and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                            let y = arr.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                            return Ok(Vec2([x, y]));
+                    match k.as_str() {
+                        "value" => {
+                            if let Some(s) = v.as_str() {
+                                res = parse_vec2_str(s);
+                            } else if let Some(arr) = v.as_array() {
+                                res = Vec2([
+                                    arr.first().and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                                    arr.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                                ]);
+                            }
                         }
-                    } else if k == "x" {
-                        res.0[0] = v.as_f64().unwrap_or(0.0) as f32;
-                    } else if k == "y" {
-                        res.0[1] = v.as_f64().unwrap_or(0.0) as f32;
+                        "x" => res.0[0] = v.as_f64().unwrap_or(0.0) as f32,
+                        "y" => res.0[1] = v.as_f64().unwrap_or(0.0) as f32,
+                        _ => {}
                     }
                 }
                 Ok(res)
@@ -224,6 +247,19 @@ impl<'de> Deserialize<'de> for Vec2 {
         }
         deserializer.deserialize_any(Vec2Visitor)
     }
+}
+
+/// Parse an `"x y"` (or `"x,y"`) vector string; missing parts are zero.
+fn parse_vec2_str(v: &str) -> Vec2 {
+    let nums: Vec<f32> = v
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    Vec2([
+        nums.first().copied().unwrap_or(0.0),
+        nums.get(1).copied().unwrap_or(0.0),
+    ])
 }
 
 pub fn deserialize_opt_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
@@ -549,18 +585,64 @@ pub struct Scene {
     pub objects: Vec<SceneObject>,
     #[serde(default)]
     pub version: Option<u32>,
+    /// Per-object keyframe animations, keyed by property name, in the same
+    /// order as `objects`. Filled by a second parse pass over the raw JSON
+    /// because a property carries both its base value and its animation under
+    /// one key, which a plain field mapping cannot express.
+    #[serde(skip)]
+    pub animations: Vec<HashMap<String, crate::animation::Animation>>,
 }
 
 impl Scene {
     /// Parse a scene from a JSON string, stripping UTF-8 BOM if present.
     pub fn from_json_str(json: &str) -> Result<Self, serde_json::Error> {
         let json = json.strip_prefix("\u{feff}").unwrap_or(json);
-        serde_json::from_str(json)
+        let mut scene: Scene = serde_json::from_str(json)?;
+        scene.attach_animations(json);
+        Ok(scene)
     }
 
     /// Parse a scene from a reader.
     pub fn from_reader<R: std::io::Read>(reader: R) -> Result<Self, serde_json::Error> {
-        serde_json::from_reader(reader)
+        let mut buf = String::new();
+        let mut reader = reader;
+        std::io::Read::read_to_string(&mut reader, &mut buf).map_err(serde_json::Error::io)?;
+        Self::from_json_str(&buf)
+    }
+
+    /// Collect each object's animated properties from the raw JSON.
+    ///
+    /// An animatable property may appear either as a bare value or as an object
+    /// carrying `value` plus `animation`; this pass keeps the animation of the
+    /// latter. A property that fails to parse is dropped rather than failing the
+    /// whole scene — a wallpaper with one malformed animation should still render.
+    fn attach_animations(&mut self, json: &str) {
+        self.animations.clear();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+            return;
+        };
+        let Some(objects) = value.get("objects").and_then(|o| o.as_array()) else {
+            return;
+        };
+        for (i, raw) in objects.iter().enumerate() {
+            let mut map = HashMap::new();
+            if i < self.objects.len() {
+                if let Some(fields) = raw.as_object() {
+                    for (key, field) in fields {
+                        if let Some(anim) = field.get("animation") {
+                            if let Ok(parsed) =
+                                serde_json::from_value::<crate::animation::Animation>(
+                                    anim.clone(),
+                                )
+                            {
+                                map.insert(key.clone(), parsed);
+                            }
+                        }
+                    }
+                }
+            }
+            self.animations.push(map);
+        }
     }
 
     /// Count objects by their inferred kind.
@@ -669,6 +751,74 @@ mod tests {
         assert_eq!(counts.get(&ObjectKind::Image), Some(&1));
         assert_eq!(counts.get(&ObjectKind::Particle), Some(&1));
         assert_eq!(counts.get(&ObjectKind::Text), Some(&1));
+    }
+
+    #[test]
+    fn a_property_with_value_and_animation_parses() {
+        // Regression: the Vec3/Vec2 visitors used to return as soon as they saw
+        // `value`, abandoning the rest of the map and making serde report a
+        // "trailing comma". An animated *vector* property (origin, scale,
+        // angles) is exactly that shape, so it failed to parse at all.
+        let json = r#"{
+            "objects": [{
+                "id": 2,
+                "origin": {
+                    "value": "400 400 0",
+                    "animation": {
+                        "c0": [{"frame": 0, "value": 400}, {"frame": 60, "value": 3400}],
+                        "c1": [{"frame": 0, "value": 400}, {"frame": 60, "value": 1800}],
+                        "options": {"fps": 30, "length": 60, "mode": "single"}
+                    }
+                },
+                "scale": {"user": "size", "value": "2 2 1"},
+                "size": {"value": "128 128"}
+            }]
+        }"#;
+        let scene = Scene::from_json_str(json).expect("animated vector property parses");
+        let obj = &scene.objects[0];
+        assert_eq!(obj.origin(), [400.0, 400.0, 0.0]);
+        assert_eq!(obj.scale(), [2.0, 2.0, 1.0]);
+        assert_eq!(obj.size(), Some([128.0, 128.0]));
+        let anim = scene.animations[0].get("origin").expect("origin animated");
+        assert_eq!(anim.sample(2.0), Some(3400.0)); // frame 60
+    }
+
+    #[test]
+    fn attaches_property_animations_by_object() {
+        // The `alpha` key carries both a base value and an animation; the base
+        // value keeps parsing into `alpha` while the animation lands in the
+        // parallel map, keyed by property, aligned with `objects`.
+        let json = r#"{
+            "objects": [
+                {
+                    "name": "Icon",
+                    "alpha": {
+                        "value": 0.0,
+                        "animation": {
+                            "c0": [{"frame": 0, "value": 0.0}, {"frame": 18, "value": 1.0}],
+                            "options": {"fps": 30, "length": 18, "mode": "single"}
+                        }
+                    }
+                },
+                { "name": "Plain", "alpha": 0.5 }
+            ]
+        }"#;
+        let scene = Scene::from_json_str(json).unwrap();
+        assert_eq!(scene.animations.len(), 2);
+        let anim = scene.animations[0].get("alpha").expect("alpha is animated");
+        assert_eq!(anim.options.fps, 30.0);
+        assert_eq!(anim.sample(0.6), Some(1.0)); // frame 18
+        assert!(scene.animations[1].is_empty());
+        // The base value is still available for a non-animated read.
+        assert_eq!(scene.objects[1].alpha(), 0.5);
+    }
+
+    #[test]
+    fn a_scene_without_animations_gets_empty_maps() {
+        let json = r#"{"objects": [{"name": "A"}, {"name": "B"}]}"#;
+        let scene = Scene::from_json_str(json).unwrap();
+        assert_eq!(scene.animations.len(), 2);
+        assert!(scene.animations.iter().all(|m| m.is_empty()));
     }
 
     #[test]

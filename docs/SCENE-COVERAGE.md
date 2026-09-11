@@ -112,10 +112,25 @@ the evidence behind each rule.
 Verification without a wallpaper: `tools/mkscene.py` builds a synthetic
 `scene.pkg` whose every object has a known position (a canvas-sized colour grid
 plus sized markers and a parented child), and
-`cargo run -p hyprwpe-render --example scenecompose -- <pkg> out.png W H [mode]`
+`cargo run -p hyprwpe-render --example scenecompose -- <pkg> out.png W H [mode] [time]`
 software-composites it through the *same* transform module the GPU renderer
 uses. A framing defect then shows up as a pixel in the wrong place, not a
-judgement call.
+judgement call. `tools/mkanim.py` is the same idea for animation: a marker on a
+known path, so a sampled time either lands where the keyframes say or it does
+not.
+
+**1b. Property animation.** 6/75 wallpapers, and implemented: an object
+property's keyframe tracks are sampled on the render clock and applied to
+`origin`, `scale`, `angles` and `alpha`, including through `parent` chains
+(`crates/core/src/animation.rs` + `scene_transform::animated_*`). Verified by
+rendering the synthetic marker scene at fixed times — (400,400) at t=0,
+(1900,1100) at t=1, (3400,1800) at t=2 — and live, where the centroid advances
+between screenshots.
+
+**1c. Puppet models (MDLV).** 12/75 wallpapers reference a `…_puppet.mdl`, which
+carries a deforming mesh and its own animation — this is what moves a character
+like the Akali phone-version body. Not implemented; such models render as their
+static material texture. This is the next large piece after particles.
 
 **2. Particles.** 52/75 wallpapers. The largest single jump available.
 
