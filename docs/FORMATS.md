@@ -402,23 +402,59 @@ The `TEXB####` payload block's revision selects the encoding:
 
 | Revision | Count | Payload |
 | --- | --- | --- |
-| `TEXB0003` | 891 | Embedded **PNG or JPEG** image (dominant case) |
-| `TEXB0004` | 103 | Embedded PNG/JPEG |
-| `TEXB0002` | 3 | Raw block-compressed texture data |
+| `TEXB0003` | 812 | **LZ4 block** of pixel data |
+| `TEXB0004` | 100 | **LZ4 block**; the header is four bytes longer |
+| `TEXB0002` | 3 | Undecoded |
 
-| Field | Source | Note |
-| --- | --- | --- |
-| `TEXV0005` magic | `bytes` | `54 45 58 56 30 30 30 35` at 0x00 |
-| `TEXI0001` info | `bytes` | Fixed-width sub-block; carries width/height as 16.16 |
-| `width`, `height` | `experiment` | Stored `value * 256`; 1920x1080 stores `0x1E0000` |
-| embedded PNG/JPEG | `bytes` | `\x89PNG` / `\xff\xd8\xff` signature inside the payload block |
-| `TEXB0003/4/2` | `bytes` | Revision byte at offset `magic+6` |
+A file may additionally embed a PNG/JPEG, but that is not what the revision
+means: an embedded image is recognised by its signature and takes precedence
+when it decodes.
 
-**How it is read for rendering.** When a `.tex` embeds a PNG/JPEG, the image
-is decoded directly with the `image` crate (dimensions and pixels both come
-from the embedded image, so the 16.16 header is informational). Raw-BC payloads
-(`TEXB0002`) are decompressed with the built-in DXT1/3/5 decoders, matching the
-declared dimensions.
+**Payload layout**, measured on files where the decoded LZ4 block length equals
+the declared size exactly (offsets from the `TEXB####` magic):
+
+```text
+TEXB0003                             TEXB0004
++9   u32  format word                +9   u32
++13  u32  flags                      +13  u32  flags
++17  u32  reserved                   +17  u32  reserved
+                                     +21  u32  reserved
++21  u32  width           = block-20 +25  u32  width       = block-20
++25  u32  height          = block-16 +29  u32  height      = block-16
++29  u32  reserved                   +33  u32  reserved
++33  u32  uncompressed    = block- 8 +37  u32  uncompressed = block- 8
++37  u32  compressed      = block- 4 +41  u32  compressed   = block- 4
++41  ..   LZ4 block                  +45  ..   LZ4 block
+```
+
+Width, height and both sizes sit a fixed distance *behind* the block, and the
+block moves by four bytes between the two revisions - so the block offset is
+taken from the revision rather than assumed. A mip chain may follow the block;
+only the first level is decoded, so the block length, not the remaining bytes,
+is the decoder's input.
+
+**The format is not a field.** The block never names its pixel format; it is
+identified by the declared uncompressed size, which must equal what a format
+occupies at those dimensions. Block formats are tried first because that is what
+these payloads are: a grayscale mask whose dimensions are both multiples of four
+is `DXT5`, whose 16 bytes per 4x4 block equal `width * height` - exactly the byte
+count `R8` would have. Decoding such a mask as `R8` renders noise instead of a
+smooth mask, verified by measuring chroma both ways (0.0-1.1 out of 255 as
+`DXT5`, i.e. grayscale).
+
+`compressed == uncompressed` means the block was stored as-is rather than
+compressed; small masks and phase textures are written that way, and decoding
+such a block as LZ4 fails on an invalid header.
+
+**How it is read for rendering.** An embedded PNG/JPEG, when present and
+decodable, supplies both dimensions and pixels. Otherwise the payload block is
+read by the layout above, LZ4-decoded (or taken raw), and the bytes are expanded
+with the DXT1/3/5 decoders or used directly for `R8`/`Rg8`/`Rgb8`/`Rgba8`.
+
+Dimensions are never invented: when no payload layout matches, the texture is
+reported as an error. An earlier fallback took the first plausible pair of header
+words, which produced textures claiming to be `512x25600` from a 10 KB file and
+made a 39% decode rate look like 88%.
 
 ### Engine asset textures are `TEXB` + **LZ4** — confirmed
 

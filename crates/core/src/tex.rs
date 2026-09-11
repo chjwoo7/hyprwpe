@@ -203,19 +203,28 @@ impl TexImage {
     fn parse_v5(bytes: &[u8]) -> Result<Self> {
         let _magic = &bytes[0..8];
 
-        // Embedded image is authoritative for dimensions and pixels.
+        // An embedded image is authoritative for dimensions and pixels - but
+        // only when it really decodes. The signature search can hit a byte
+        // pattern inside binary payload data, and treating that as a hard error
+        // would sink a file whose payload the decoders below can read just fine.
         if let Some((start, _)) = find_embedded_image(bytes) {
-            let img = image::load_from_memory(&bytes[start..])
-                .context("decoding embedded image in .tex")?;
-            let rgba = img.to_rgba8();
-            let dims = rgba.dimensions();
-            drop(rgba);
-            return Ok(TexImage {
-                width: dims.0,
-                height: dims.1,
-                format: TexFormat::Image,
-                data: bytes[start..].to_vec(),
-            });
+            if let Ok(img) = image::load_from_memory(&bytes[start..]) {
+                let rgba = img.to_rgba8();
+                let dims = rgba.dimensions();
+                return Ok(TexImage {
+                    width: dims.0,
+                    height: dims.1,
+                    format: TexFormat::Image,
+                    data: bytes[start..].to_vec(),
+                });
+            }
+        }
+
+        // The LZ4 revisions (`TEXB0003`/`TEXB0004`) state their own layout - the
+        // block offset, dimensions, and both sizes - so they decode without a
+        // sidecar, which matters because workshop textures almost never have one.
+        if let Some(img) = parse_asset_texb(bytes, TexFormat::Unknown(0)) {
+            return Ok(img);
         }
 
         // No embedded image: raw pixel/block data. Wallpaper Engine TEX headers
@@ -362,6 +371,7 @@ impl TexImage {
 /// whose remaining bytes (from some plausible payload start) exactly match a
 /// known encoding is accepted.
 fn dims_from_payload(bytes: &[u8]) -> Result<(u32, u32, usize, TexFormat)> {
+    let bytes_len = bytes.len();
     let Some(tb) = find_texb(bytes) else {
         bail!("TEXV0005 with no TEXB payload");
     };
@@ -441,12 +451,12 @@ fn dims_from_payload(bytes: &[u8]) -> Result<(u32, u32, usize, TexFormat)> {
         }
     }
 
-    // No exact match: fall back to the first plausible header dims and leave
-    // the whole TEXB payload as-is; to_rgba8 will report what is wrong.
-    if let Some(&(w, h)) = candidates.first() {
-        return Ok((w, h, tb + 8, TexFormat::Dxt5));
-    }
-    bail!("could not determine .tex dimensions from payload")
+    // No exact match means this file's payload is not one this decoder can size,
+    // and saying so is the honest answer. Fabricating dimensions from an
+    // unvalidated header field produced textures claiming to be 512x25600 from a
+    // 10 KB file, and a bogus size is worse than a missing texture: it reaches
+    // the GPU as garbage instead of being reported.
+    bail!("no payload in {bytes_len} bytes matches a known encoding (TEXB at {tb})")
 }
 
 fn blocks_for(width: u32, height: u32) -> u64 {
@@ -529,47 +539,89 @@ fn parse_asset_texb(bytes: &[u8], format: TexFormat) -> Option<TexImage> {
         }
     }
 
+    // `TEXB0003` and `TEXB0004` hold an LZ4 block and state its layout relative
+    // to where that block starts: width at -20, height at -16, the uncompressed
+    // size at -8 and the compressed size at -4, all plain integers. Verified
+    // against files whose LZ4 length is exactly the declared compressed size
+    // (192 -> 40000 for a 100x100 RGBA texture, 47371 and 40804 for 256x256).
+    //
+    // The block offset differs between the two revisions - `TEXB0004`'s header
+    // is four bytes longer - so it is taken from the revision, the same way the
+    // field offsets above are. A mip chain may follow the block; only the first
+    // level is decoded, so the block length, not the remaining bytes, is the
+    // input.
     let u32at = |o: usize| -> Option<u32> {
         let s = bytes.get(o..o + 4)?;
         Some(u32::from_le_bytes(s.try_into().ok()?))
     };
-    // A mip chain uses a different payload codec, which is not implemented.
-    if u32at(tb + 16)? >> 8 != 1 {
-        return None;
-    }
-    let width = u32at(tb + 20)? >> 8;
-    let height = u32at(tb + 24)? >> 8;
-    // The size fields are 16.16 fixed point too.
-    let raw_size = (u32at(tb + 32)? >> 8) as usize;
-    let compressed = (u32at(tb + 36)? >> 8) as usize;
-    if width == 0 || height == 0 || width > 16384 || height > 16384 {
-        return None;
-    }
-    let bpp = match format {
-        TexFormat::Rgba8 => 4,
-        TexFormat::Rgb8 => 3,
-        TexFormat::Rg8 => 2,
-        TexFormat::R8 => 1,
+    let payload = match bytes.get(tb + 4..tb + 8) {
+        Some(b"0003") => tb + 41,
+        Some(b"0004") => tb + 45,
         _ => return None,
     };
-    let expected = (width as usize) * (height as usize) * bpp;
-    // The header's own sizes must agree with the format before trusting them.
-    if raw_size != expected {
+    let width = u32at(payload.checked_sub(20)?)?;
+    let height = u32at(payload.checked_sub(16)?)?;
+    let raw_size = u32at(payload.checked_sub(8)?)? as usize;
+    let compressed = u32at(payload.checked_sub(4)?)? as usize;
+    if width == 0 || height == 0 || width > 16384 || height > 16384 || compressed == 0 {
         return None;
     }
-    let start = tb + 41;
-    let end = (start + compressed).min(bytes.len());
-    let payload = bytes.get(start..end)?;
-    let data = lz4_flex::block::decompress(payload, expected).ok()?;
-    if data.len() != expected {
+    // The header names the payload's format; a sidecar is the fallback when it
+    // names one this decoder does not know.
+    // The declared uncompressed size is what identifies the pixel format: each
+    // candidate format occupies a known number of bytes for these dimensions, so
+    // the one that agrees with the header is not a guess. Block formats are
+    // preferred when two agree, because that is what workshop payloads are;
+    // `R8` and `DXT3`/`DXT5` occupy the same number of bytes whenever both
+    // dimensions are multiples of four, which is the one genuinely ambiguous case.
+    let format = match format_for_size(width, height, raw_size) {
+        Some(inferred) => inferred,
+        None => match TexFormat::from_u32(u32at(tb + 9)?) {
+            TexFormat::Unknown(_) => format,
+            known => known,
+        },
+    };
+    let expected = raw_size;
+    if expected == 0 {
         return None;
     }
+    let end = (payload + compressed).min(bytes.len());
+    let block = bytes.get(payload..end)?;
+    let data = match lz4_flex::block::decompress(block, expected) {
+        Ok(decoded) if decoded.len() == expected => decoded,
+        // `compressed == uncompressed` means the block was stored as-is rather
+        // than run through LZ4: small masks and phase textures are written this
+        // way, and decoding such a block as LZ4 fails on an invalid header.
+        _ if compressed == expected && block.len() == expected => block.to_vec(),
+        _ => return None,
+    };
     Some(TexImage {
         width,
         height,
         format,
         data,
     })
+}
+
+/// The pixel format whose bytes-per-image matches `size` for these dimensions.
+///
+/// This is how the container states a format without a dedicated field: the
+/// declared size has to equal what the format would occupy. Block formats come
+/// first when several agree, because that is what these payloads are - the
+/// engine's own greyscale masks are DXT5, which decoding as `R8` would also
+/// "fit" but render as noise instead of a smooth mask.
+fn format_for_size(width: u32, height: u32, size: usize) -> Option<TexFormat> {
+    [
+        TexFormat::Dxt1,
+        TexFormat::Dxt5,
+        TexFormat::Dxt3,
+        TexFormat::Rgba8,
+        TexFormat::Rgb8,
+        TexFormat::Rg8,
+        TexFormat::R8,
+    ]
+    .into_iter()
+    .find(|fmt| fmt.level_bytes(width, height) == Some(size))
 }
 
 /// Convert 16-bit RGB565 to 24-bit RGB888.
@@ -885,6 +937,86 @@ mod tests {
             "level 0 only; the mip tail is not part of the image"
         );
         assert_eq!(tex.to_rgba8().expect("decodes to rgba"), level0);
+    }
+
+    /// Build a `TEXV0005` + `TEXB0004` file around `payload`.
+    ///
+    /// `TEXB0004`'s header is four bytes longer than `TEXB0003`'s, which is why
+    /// the block offset has to come from the revision rather than be assumed.
+    fn texb0004(width: u32, height: u32, raw_size: u32, payload: &[u8]) -> Vec<u8> {
+        let mut texb = Vec::new();
+        texb.extend_from_slice(b"TEXB0004");
+        texb.push(0); // Padding byte, then the header fields
+        texb.extend_from_slice(&1u32.to_le_bytes()); // Format word
+        texb.extend_from_slice(&u32::MAX.to_le_bytes()); // Flags
+        texb.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+        texb.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+        texb.extend_from_slice(&width.to_le_bytes());
+        texb.extend_from_slice(&height.to_le_bytes());
+        texb.extend_from_slice(&1u32.to_le_bytes()); // Reserved: levels
+        texb.extend_from_slice(&raw_size.to_le_bytes()); // Uncompressed size
+        texb.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // Compressed size
+        texb.extend_from_slice(payload);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TEXV0005\x00");
+        bytes.extend_from_slice(b"TEXI0001");
+        // The header before `TEXB` is not what identifies the payload; keep it
+        // out of the way so the test pins the block layout, not the prefix.
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&texb);
+        bytes
+    }
+
+    /// Regression: `TEXB0003`/`TEXB0004` carry an LZ4 block whose layout is
+    /// stated relative to the block, and `TEXB0004`'s header is four bytes longer
+    /// than `TEXB0003`'s. Assuming one fixed offset made every `TEXB0004` fail -
+    /// which is most of the engine's and the corpus' textures.
+    #[test]
+    fn parse_texb0004_lz4_payload() {
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 7) as u8).collect();
+        let compressed = lz4_flex::block::compress(&pixels);
+        let bytes = texb0004(w, h, w * h * 4, &compressed);
+
+        let tex = TexImage::parse(&bytes).expect("valid texb0004");
+        assert_eq!((tex.width, tex.height), (w, h));
+        assert_eq!(tex.format, TexFormat::Rgba8);
+        assert_eq!(tex.to_rgba8().expect("decodes"), pixels);
+    }
+
+    /// The pixel format is identified by the size the header declares, because
+    /// the container has no format field. A grayscale mask declared as one byte
+    /// per pixel is `R8`; the same byte count is also what `DXT5` would occupy
+    /// when both dimensions are multiples of four.
+    #[test]
+    fn parse_texb0004_identifies_format_from_declared_size() {
+        // 4x4: R8 is 16 bytes, DXT5 is also 16 bytes - the ambiguous case, which
+        // must resolve to the block format these payloads actually use.
+        let (w, h) = (4u32, 4u32);
+        let sixteen = vec![0u8; 16];
+        let bytes = texb0004(w, h, 16, &sixteen);
+        let tex = TexImage::parse(&bytes).expect("valid texb0004");
+        assert_eq!(tex.format, TexFormat::Dxt5);
+
+        // 4x4 RGBA is 64 bytes, which only `Rgba8` occupies.
+        let bytes = texb0004(w, h, 64, &[0u8; 64]);
+        let tex = TexImage::parse(&bytes).expect("valid texb0004");
+        assert_eq!(tex.format, TexFormat::Rgba8);
+    }
+
+    /// Regression: `compressed == uncompressed` means the block was stored as-is.
+    /// Small masks and phase textures are written that way, and decoding such a
+    /// block as LZ4 fails, which used to drop the texture entirely.
+    #[test]
+    fn parse_texb0004_stores_small_blocks_uncompressed() {
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 3) as u8).collect();
+        let bytes = texb0004(w, h, w * h * 4, &pixels);
+
+        let tex = TexImage::parse(&bytes).expect("valid texb0004, stored raw");
+        assert_eq!(tex.format, TexFormat::Rgba8);
+        assert_eq!(tex.to_rgba8().expect("decodes"), pixels);
     }
 
     #[test]
