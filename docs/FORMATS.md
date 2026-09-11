@@ -402,9 +402,9 @@ The `TEXB####` payload block's revision selects the encoding:
 
 | Revision | Count | Payload |
 | --- | --- | --- |
+| `TEXB0002` | 3 | **LZ4 block** of pixel data |
 | `TEXB0003` | 812 | **LZ4 block** of pixel data |
-| `TEXB0004` | 100 | **LZ4 block**; the header is four bytes longer |
-| `TEXB0002` | 3 | Undecoded |
+| `TEXB0004` | 100 | **LZ4 block**; one header word longer again |
 
 A file may additionally embed a PNG/JPEG, but that is not what the revision
 means: an embedded image is recognised by its signature and takes precedence
@@ -414,24 +414,24 @@ when it decodes.
 the declared size exactly (offsets from the `TEXB####` magic):
 
 ```text
-TEXB0003                             TEXB0004
-+9   u32  format word                +9   u32
-+13  u32  flags                      +13  u32  flags
-+17  u32  reserved                   +17  u32  reserved
-                                     +21  u32  reserved
-+21  u32  width           = block-20 +25  u32  width       = block-20
-+25  u32  height          = block-16 +29  u32  height      = block-16
-+29  u32  reserved                   +33  u32  reserved
-+33  u32  uncompressed    = block- 8 +37  u32  uncompressed = block- 8
-+37  u32  compressed      = block- 4 +41  u32  compressed   = block- 4
-+41  ..   LZ4 block                  +45  ..   LZ4 block
+TEXB0002                  TEXB0003                  TEXB0004
++9   u32 format           +9   u32 format           +9   u32 format
++13  u32 flags            +13  u32 flags            +13  u32 flags
++17  u32 width  = blk-20  +17  u32 reserved         +17  u32 reserved
++21  u32 height = blk-16  +21  u32 width  = blk-20  +21  u32 reserved
++25  u32 reserved         +25  u32 height = blk-16  +25  u32 width  = blk-20
++29  u32 uncomp = blk- 8  +29  u32 reserved         +29  u32 height = blk-16
++33  u32 comp   = blk- 4  +33  u32 uncomp = blk- 8  +33  u32 reserved
++37  ..  LZ4 block        +37  u32 comp   = blk- 4  +37  u32 uncomp = blk- 8
+                         +41  ..  LZ4 block        +41  u32 comp   = blk- 4
+                                                   +45  ..  LZ4 block
 ```
 
-Width, height and both sizes sit a fixed distance *behind* the block, and the
-block moves by four bytes between the two revisions - so the block offset is
-taken from the revision rather than assumed. A mip chain may follow the block;
-only the first level is decoded, so the block length, not the remaining bytes,
-is the decoder's input.
+Every revision's header is one word longer than the one before it, and the block
+moves with it - so the block offset is taken from the revision while the field
+offsets are stated *relative to the block*, which is the form that holds across
+all three. A mip chain may follow the block; only the first level is decoded, so
+the block length, not the remaining bytes, is the decoder's input.
 
 **The format is not a field.** The block never names its pixel format; it is
 identified by the declared uncompressed size, which must equal what a format
@@ -451,10 +451,14 @@ decodable, supplies both dimensions and pixels. Otherwise the payload block is
 read by the layout above, LZ4-decoded (or taken raw), and the bytes are expanded
 with the DXT1/3/5 decoders or used directly for `R8`/`Rg8`/`Rgb8`/`Rgba8`.
 
+Measured over 915 unique textures from 75 packages: **all 915 decode**, by
+revision 3, 2 and 4 in full.
+
 Dimensions are never invented: when no payload layout matches, the texture is
 reported as an error. An earlier fallback took the first plausible pair of header
-words, which produced textures claiming to be `512x25600` from a 10 KB file and
-made a 39% decode rate look like 88%.
+words, which produced textures claiming to be `512x25600` from a 10 KB file - and
+made a real 39% decode rate read as 88%, which is the failure mode a plausible
+number hides.
 
 ### Engine asset textures are `TEXB` + **LZ4** — confirmed
 

@@ -539,22 +539,23 @@ fn parse_asset_texb(bytes: &[u8], format: TexFormat) -> Option<TexImage> {
         }
     }
 
-    // `TEXB0003` and `TEXB0004` hold an LZ4 block and state its layout relative
-    // to where that block starts: width at -20, height at -16, the uncompressed
-    // size at -8 and the compressed size at -4, all plain integers. Verified
-    // against files whose LZ4 length is exactly the declared compressed size
-    // (192 -> 40000 for a 100x100 RGBA texture, 47371 and 40804 for 256x256).
+    // `TEXB0002`, `TEXB0003` and `TEXB0004` hold an LZ4 block and state its
+    // layout relative to where that block starts: width at -20, height at -16,
+    // the uncompressed size at -8 and the compressed size at -4, all plain
+    // integers. Verified against files whose LZ4 length is exactly the declared
+    // compressed size (192 -> 40000 for a 100x100 RGBA texture, 47371 and 40804
+    // for 256x256, 261508 -> 262144 for revision 2).
     //
-    // The block offset differs between the two revisions - `TEXB0004`'s header
-    // is four bytes longer - so it is taken from the revision, the same way the
-    // field offsets above are. A mip chain may follow the block; only the first
-    // level is decoded, so the block length, not the remaining bytes, is the
-    // input.
+    // The block offset differs per revision - one header word each - so it is
+    // taken from the revision, the same way the field offsets above are. A mip
+    // chain may follow the block; only the first level is decoded, so the block
+    // length, not the remaining bytes, is the input.
     let u32at = |o: usize| -> Option<u32> {
         let s = bytes.get(o..o + 4)?;
         Some(u32::from_le_bytes(s.try_into().ok()?))
     };
     let payload = match bytes.get(tb + 4..tb + 8) {
+        Some(b"0002") => tb + 37,
         Some(b"0003") => tb + 41,
         Some(b"0004") => tb + 45,
         _ => return None,
@@ -939,18 +940,20 @@ mod tests {
         assert_eq!(tex.to_rgba8().expect("decodes to rgba"), level0);
     }
 
-    /// Build a `TEXV0005` + `TEXB0004` file around `payload`.
+    /// Build a `TEXV0005` + `TEXB####` file around `payload`.
     ///
-    /// `TEXB0004`'s header is four bytes longer than `TEXB0003`'s, which is why
-    /// the block offset has to come from the revision rather than be assumed.
-    fn texb0004(width: u32, height: u32, raw_size: u32, payload: &[u8]) -> Vec<u8> {
+    /// Each revision's header is one word longer than the one before it, which
+    /// is why the block offset has to come from the revision rather than be
+    /// assumed. `revision` is the two-digit code (`"02"`, `"03"`, `"04"`).
+    fn texb(revision: &str, width: u32, height: u32, raw_size: u32, payload: &[u8]) -> Vec<u8> {
         let mut texb = Vec::new();
-        texb.extend_from_slice(b"TEXB0004");
+        texb.extend_from_slice(format!("TEXB00{revision}").as_bytes());
         texb.push(0); // Padding byte, then the header fields
         texb.extend_from_slice(&1u32.to_le_bytes()); // Format word
         texb.extend_from_slice(&u32::MAX.to_le_bytes()); // Flags
-        texb.extend_from_slice(&0u32.to_le_bytes()); // Reserved
-        texb.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+        for _ in 0..revision.parse::<u32>().unwrap_or(3).saturating_sub(2) {
+            texb.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+        }
         texb.extend_from_slice(&width.to_le_bytes());
         texb.extend_from_slice(&height.to_le_bytes());
         texb.extend_from_slice(&1u32.to_le_bytes()); // Reserved: levels
@@ -966,6 +969,35 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 32]);
         bytes.extend_from_slice(&texb);
         bytes
+    }
+
+    /// Build a `TEXV0005` + `TEXB0004` file around `payload`.
+    fn texb0004(width: u32, height: u32, raw_size: u32, payload: &[u8]) -> Vec<u8> {
+        texb("04", width, height, raw_size, payload)
+    }
+
+    /// Every LZ4 revision states the same layout relative to its block, and the
+    /// block moves by one word per revision. Revision 2's offset is four bytes
+    /// before revision 3's, so handling only 3 and 4 left three corpus textures
+    /// undecodable.
+    #[test]
+    fn parse_texb0002_lz4_payload() {
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 5) as u8).collect();
+        let compressed = lz4_flex::block::compress(&pixels);
+
+        for revision in ["02", "03", "04"] {
+            let bytes = texb(revision, w, h, w * h * 4, &compressed);
+            let tex =
+                TexImage::parse(&bytes).unwrap_or_else(|e| panic!("revision {revision}: {e}"));
+            assert_eq!((tex.width, tex.height), (w, h), "revision {revision}");
+            assert_eq!(tex.format, TexFormat::Rgba8, "revision {revision}");
+            assert_eq!(
+                tex.to_rgba8().expect("decodes"),
+                pixels,
+                "revision {revision} must decode to the same pixels"
+            );
+        }
     }
 
     /// Regression: `TEXB0003`/`TEXB0004` carry an LZ4 block whose layout is
