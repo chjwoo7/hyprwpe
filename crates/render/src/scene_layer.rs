@@ -22,6 +22,7 @@ use crate::skin::{deform, Rig};
 use hyprwpe_core::animation::Animation;
 use hyprwpe_core::mdlv;
 use hyprwpe_core::particle as particle_def;
+use hyprwpe_core::properties::PropertySet;
 use hyprwpe_core::scene::SceneObject;
 use std::collections::HashMap;
 
@@ -341,6 +342,11 @@ pub struct ScenePlayer {
     animated: bool,
     /// Clock origin for animation time.
     start: std::time::Instant,
+    /// When the last frame was actually drawn. A frame cap needs to know how
+    /// long it has been, and the alternative - trusting the compositor's frame
+    /// callbacks - gives up the cap entirely (they arrive at the panel's refresh
+    /// rate, not ours).
+    last_draw: std::time::Instant,
     is_paused: bool,
 }
 
@@ -359,6 +365,20 @@ impl ScenePlayer {
     ///
     /// `scaling` is the output's fitting mode, applied to the design canvas.
     pub fn new(path: &Path, gl: &glow::Context, scaling: Scaling) -> Result<Self> {
+        Self::with_properties(path, gl, scaling, &PropertySet::default())
+    }
+
+    /// Load a scene with a wallpaper's user properties applied.
+    ///
+    /// Bindings are resolved on the raw document before it is parsed, so nothing
+    /// downstream needs to know the binding syntax exists: layers, puppets,
+    /// particles and animations all read plain values.
+    pub fn with_properties(
+        path: &Path,
+        gl: &glow::Context,
+        scaling: Scaling,
+        properties: &PropertySet,
+    ) -> Result<Self> {
         let pkg_path = if path.is_dir() {
             path.join("scene.pkg")
         } else {
@@ -371,7 +391,8 @@ impl ScenePlayer {
         let scene_json = pkg
             .get_str("scene.json")
             .context("scene.pkg contains no scene.json")?;
-        let scene = Scene::from_json_str(&scene_json).context("parsing scene.json from package")?;
+        let scene = Scene::from_json_with_properties(&scene_json, properties)
+            .context("parsing scene.json from package")?;
 
         unsafe {
             let vs = compile_shader(gl, glow::VERTEX_SHADER, VERTEX_SHADER_SOURCE)?;
@@ -542,6 +563,7 @@ impl ScenePlayer {
                 animations: scene.animations.clone(),
                 animated,
                 start: std::time::Instant::now(),
+                last_draw: std::time::Instant::now(),
                 is_paused: false,
             })
         }
@@ -549,6 +571,25 @@ impl ScenePlayer {
 
     pub fn set_paused(&mut self, paused: bool) {
         self.is_paused = paused;
+    }
+
+    /// Whether a frame is due, given an optional cap.
+    ///
+    /// `None` means "draw whenever the compositor asks", which is the default
+    /// and matches the previous behaviour. A cap lets a 165 Hz panel drive an
+    /// animated wallpaper at 60: the frame callback still arrives 165 times a
+    /// second, but the geometry, the skinning and the particle step are skipped
+    /// for the ones that fall inside the interval.
+    pub fn due(&self, interval: Option<std::time::Duration>) -> bool {
+        match interval {
+            None => true,
+            Some(i) => self.last_draw.elapsed() >= i,
+        }
+    }
+
+    /// Record that a frame was just drawn.
+    pub fn mark_drawn(&mut self) {
+        self.last_draw = std::time::Instant::now();
     }
 
     /// Render scene layers onto the viewport.

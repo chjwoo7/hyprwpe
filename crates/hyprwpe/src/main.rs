@@ -70,6 +70,29 @@ enum Command {
         source: Vec<PathBuf>,
     },
 
+    /// List the settings a wallpaper exposes, and their current values.
+    Properties {
+        /// Wallpaper path or catalog id.
+        wallpaper: String,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Change one of a wallpaper's settings and re-apply it live.
+    SetProperty {
+        /// Wallpaper path or catalog id.
+        wallpaper: String,
+        /// Property key, as `hyprwpe properties` prints it.
+        key: String,
+        /// New value. Parsed as JSON when it can be, so `0.5`, `true` and
+        /// `"text"` all work as written.
+        value: String,
+    },
+
+    /// Print the effective configuration and where it was read from.
+    Config,
+
     /// Show an image without a daemon, holding it until interrupted.
     ///
     /// Useful for testing a renderer in isolation; `set` is the normal way in.
@@ -133,6 +156,13 @@ fn main() -> Result<()> {
         Command::Resume => resume(),
         Command::Stop => stop(),
         Command::List { kind, json, source } => list(kind.map(Kind::from), json, source),
+        Command::Properties { wallpaper, json } => properties(&wallpaper, json),
+        Command::SetProperty {
+            wallpaper,
+            key,
+            value,
+        } => set_property(&wallpaper, &key, &value),
+        Command::Config => show_config(),
         Command::Show { image, scaling } => Wallpapers::run_standalone(&image, scaling.into()),
     }
 }
@@ -222,6 +252,101 @@ fn set(wallpaper: &str, output: Option<String>, scaling: Scaling) -> Result<()> 
         scaling: scaling.as_str().to_string(),
     })?;
     eprintln!("set {} on {}", wallpaper, target);
+    Ok(())
+}
+
+/// Parse a value the way a user would write it.
+///
+/// JSON first, so `0.5`, `true`, `"a string"` and numbers keep their types;
+/// a bare word that is not valid JSON is taken as a string, because that is
+/// what someone typing `hyprwpe set-property X mode Rain` means.
+fn parse_value(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+fn properties(wallpaper: &str, json: bool) -> Result<()> {
+    let path = resolve(wallpaper)?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+
+    let Response::Properties {
+        properties,
+        script_bindings,
+    } = client::send_ok(&Request::Properties { path })?
+    else {
+        bail!("daemon returned an unexpected response to properties");
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&properties)?);
+        return Ok(());
+    }
+
+    if properties.is_empty() {
+        println!("{} has no settings", wallpaper);
+        return Ok(());
+    }
+
+    for p in &properties {
+        let value = serde_json::to_string(&p.value).unwrap_or_default();
+        let mut line = format!("{:28} {:9} {}", p.key, p.kind.as_str(), value);
+        if let Some(r) = &p.range {
+            line.push_str(&format!("   ({}..{})", r.min, r.max));
+        }
+        if !p.options.is_empty() {
+            let opts: Vec<String> = p
+                .options
+                .iter()
+                .map(|o| format!("{}={}", o.label, o.value))
+                .collect();
+            line.push_str(&format!("   [{}]", opts.join(", ")));
+        }
+        if !p.kind.is_editable() {
+            line.push_str("   (label, not a value)");
+        }
+        if !p.text.is_empty() && p.text != p.key {
+            line.push_str(&format!("   # {}", p.text));
+        }
+        println!("{line}");
+    }
+    if script_bindings > 0 {
+        // Do not let a setting look broken when the cause is known.
+        eprintln!(
+            "note: {script_bindings} scene field(s) are driven by SceneScript, which hyprwpe does not run; \
+             changing those settings has no visible effect"
+        );
+    }
+    Ok(())
+}
+
+fn set_property(wallpaper: &str, key: &str, value: &str) -> Result<()> {
+    let path = resolve(wallpaper)?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    let value = parse_value(value);
+    match client::send_ok(&Request::SetProperty {
+        path,
+        key: key.to_string(),
+        value: value.clone(),
+    })? {
+        Response::Ok => {
+            eprintln!("{key} = {}", serde_json::to_string(&value)?);
+            Ok(())
+        }
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("daemon returned an unexpected response: {other:?}"),
+    }
+}
+
+fn show_config() -> Result<()> {
+    let config = Config::load();
+    match hyprwpe_core::settings::config_path() {
+        Some(p) => println!("# {}", p.display()),
+        None => println!("# (no config directory)"),
+    }
+    print!("{}", config.to_toml());
     Ok(())
 }
 

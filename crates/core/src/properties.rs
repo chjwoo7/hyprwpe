@@ -455,6 +455,43 @@ impl PropertySet {
         }
     }
 
+    /// Load the properties a wallpaper exposes, from disk.
+    ///
+    /// `path` may be the `scene.pkg` or the directory holding it. `project.json`
+    /// beside the package is preferred, because it is where the editor keeps the
+    /// panel metadata (`text`, `order`, `index`) that the packed `scene.json` can
+    /// omit; the package's own document is the fallback. A wallpaper with neither
+    /// yields an empty set, not an error - most of the library is fine to render
+    /// without any input.
+    pub fn for_wallpaper(path: &std::path::Path) -> PropertySet {
+        let (dir, pkg) = if path.is_dir() {
+            (Some(path.to_path_buf()), path.join("scene.pkg"))
+        } else {
+            (path.parent().map(|p| p.to_path_buf()), path.to_path_buf())
+        };
+
+        if let Some(dir) = &dir {
+            if let Ok(text) = std::fs::read(dir.join("project.json")) {
+                let text = String::from_utf8_lossy(&text);
+                if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let set = Self::from_document(&doc);
+                    if !set.is_empty() {
+                        return set;
+                    }
+                }
+            }
+        }
+
+        if let Ok(res) = crate::assets::Resources::open(&pkg) {
+            if let Some(text) = res.get_str("scene.json") {
+                if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+                    return Self::from_document(&doc);
+                }
+            }
+        }
+        PropertySet::default()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.properties.is_empty()
     }
@@ -512,6 +549,144 @@ impl PropertySet {
             map.insert(p.key.clone(), serde_json::Value::Object(entry));
         }
         serde_json::Value::Object(map)
+    }
+    /// Resolve every user-property binding in a scene document **in place**.
+    ///
+    /// Any field in a scene may carry a binding instead of a plain value, so
+    /// this walks the whole tree and rewrites the three shapes the engine uses.
+    /// Doing it generically is what makes one implementation serve every
+    /// wallpaper: there is no per-field table, because *any* field can be bound.
+    ///
+    /// ```jsonc
+    /// "alpha":  { "user": "bladesopacity", "value": 1.0 }              // plain
+    /// "visible":{ "user": { "name": "eye", "condition": "1" }, ... }   // combo
+    /// "origin": { "script": "…js…", "value": "0 0 0" }                 // script (see below)
+    /// ```
+    ///
+    /// A **combo** binding carries a `condition`, which *gates* the field: when
+    /// the property's current value equals the condition the field takes the
+    /// binding's `value`, and when it does not the field is hidden.
+    ///
+    /// The library makes this unambiguous. Creators bind one object group per
+    /// combo option and author `value: true` on the option that shows it and
+    /// `value: false` on the rest - `clocklocation` has six objects, `true` for
+    /// option 1 and `false` for options 2..5, and `timeofday` has ten each for
+    /// options 3 and 4. Under any reading that *inverts* the value on a
+    /// non-match every clock location would be on screen at once, so the
+    /// condition can only be a gate.
+    ///
+    /// A **`script`** binding is SceneScript: a JavaScript expression evaluated
+    /// per frame. This crate does not run JS, so the authored static `value` is
+    /// used and the script is left untouched - the wallpaper still renders, it
+    /// merely does not animate that field. `count_scripts` reports how many were
+    /// skipped so that limitation is visible rather than silent.
+    pub fn resolve(&self, doc: &mut serde_json::Value) -> usize {
+        let mut scripts = 0;
+        resolve_value(doc, self, &mut scripts);
+        scripts
+    }
+
+    /// Count the `script`-driven bindings in a document without resolving it.
+    pub fn count_scripts(doc: &serde_json::Value) -> usize {
+        fn walk(v: &serde_json::Value, n: &mut usize) {
+            match v {
+                serde_json::Value::Object(o) => {
+                    if o.contains_key("script") {
+                        *n += 1;
+                        return;
+                    }
+                    for x in o.values() {
+                        walk(x, n);
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for x in a {
+                        walk(x, n);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut n = 0;
+        walk(doc, &mut n);
+        n
+    }
+}
+
+/// Recursive worker for [`PropertySet::resolve`].
+fn resolve_value(v: &mut serde_json::Value, props: &PropertySet, scripts: &mut usize) {
+    use serde_json::Value;
+    match v {
+        Value::Array(a) => {
+            for x in a.iter_mut() {
+                resolve_value(x, props, scripts);
+            }
+        }
+        Value::Object(o) => {
+            if o.contains_key("script") {
+                // SceneScript: keep the authored `value`, count the skip.
+                *scripts += 1;
+                return;
+            }
+            if let Some(user) = o.get("user").cloned() {
+                let (name, condition) = match &user {
+                    Value::String(s) => (Some(s.clone()), None),
+                    Value::Object(u) => (
+                        u.get("name").and_then(|n| n.as_str()).map(String::from),
+                        u.get("condition")
+                            .and_then(|c| c.as_str())
+                            .map(String::from),
+                    ),
+                    _ => (None, None),
+                };
+                let base = o.get("value").cloned().unwrap_or(Value::Null);
+                if let Some(name) = name {
+                    if let Some(prop) = props.get(&name) {
+                        let chosen = match condition {
+                            // No condition: the property's value replaces the field.
+                            None => Some(prop.value.clone()),
+                            // A condition gates the field: it takes the binding's
+                            // value when it holds, and is hidden when it does not.
+                            Some(cond) => {
+                                if matches_condition(&prop.value, &cond) {
+                                    Some(base.clone())
+                                } else if base.is_boolean() {
+                                    Some(Value::Bool(false))
+                                } else {
+                                    // Nothing sensible to hide for a non-boolean
+                                    // (a colour, an origin); keep what it had.
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(chosen) = chosen {
+                            *v = chosen;
+                            return;
+                        }
+                    }
+                }
+                // Unmatched binding: fall back to the authored value so the scene
+                // still has something usable for the field.
+                *v = base;
+                return;
+            }
+            for x in o.values_mut() {
+                resolve_value(x, props, scripts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a property's current value equals a combo condition.
+fn matches_condition(value: &serde_json::Value, condition: &str) -> bool {
+    match value {
+        serde_json::Value::String(s) => s == condition,
+        serde_json::Value::Number(n) => n.to_string() == condition,
+        serde_json::Value::Bool(b) => {
+            (if *b { "1" } else { "0" }) == condition || b.to_string() == condition
+        }
+        _ => false,
     }
 }
 
@@ -794,5 +969,123 @@ mod tests {
     fn a_scene_without_properties_yields_an_empty_set_not_a_failure() {
         let set = PropertySet::from_document(&json!({"general": {"clearcolor": "0 0 0"}}));
         assert!(set.is_empty());
+    }
+
+    /// The binding shapes taken verbatim from `scene.json` in the library.
+    #[test]
+    fn a_plain_user_binding_takes_the_property_value() {
+        let g = json!({"properties": {
+            "bladesopacity": {"fraction":true,"type":"slider","min":0,"max":5,"value":0.4}
+        }});
+        let set = PropertySet::from_general(&g);
+        let mut doc = json!({
+            "objects": [{"instanceoverride": {"alpha": {"user": "bladesopacity", "value": 1.0}}}]
+        });
+        let skipped = set.resolve(&mut doc);
+        assert_eq!(skipped, 0);
+        assert_eq!(doc["objects"][0]["instanceoverride"]["alpha"], json!(0.4));
+    }
+
+    /// A combo condition *gates* the field: only the group whose condition
+    /// matches is visible, and a group whose option is not selected stays hidden
+    /// rather than being inverted into view.
+    ///
+    /// The shape is from the library's `clocklocation`, whose six objects are
+    /// authored `true` for option 1 and `false` for options 2..5. Inverting on a
+    /// non-match would put all six clock locations on screen at once.
+    #[test]
+    fn a_combo_condition_gates_the_group_it_names() {
+        let g = json!({"properties": {
+            "clocklocation": {"type":"combo","options":[
+                {"label":"Top left","value":"1"},{"label":"Top right","value":"2"}],"value":"1"}
+        }});
+        let set = PropertySet::from_general(&g);
+        let mut doc = json!({
+            "objects": [
+                {"name":"tl","visible": {"user": {"name":"clocklocation","condition":"1"}, "value": true}},
+                {"name":"tr","visible": {"user": {"name":"clocklocation","condition":"2"}, "value": false}},
+                {"name":"bl","visible": {"user": {"name":"clocklocation","condition":"3"}, "value": false}}
+            ]
+        });
+        set.resolve(&mut doc);
+        assert_eq!(
+            doc["objects"][0]["visible"],
+            json!(true),
+            "the selected option shows"
+        );
+        assert_eq!(
+            doc["objects"][1]["visible"],
+            json!(false),
+            "an unselected option is hidden"
+        );
+        assert_eq!(
+            doc["objects"][2]["visible"],
+            json!(false),
+            "and so is one with no option yet"
+        );
+    }
+
+    /// The library's `timeofday`: ten objects authored `false` for option 3 and
+    /// ten authored `true` for option 4. Only the selected set may show.
+    #[test]
+    fn only_the_selected_option_group_shows() {
+        let g = json!({"properties": {"timeofday": {"type":"combo","value":"4"}}});
+        let mut set = PropertySet::from_general(&g);
+        let render = |set: &PropertySet| {
+            let mut doc = json!({
+                "objects": [
+                    {"n":"night","visible": {"user": {"name":"timeofday","condition":"3"}, "value": false}},
+                    {"n":"day","visible":   {"user": {"name":"timeofday","condition":"4"}, "value": true}}
+                ]
+            });
+            set.resolve(&mut doc);
+            (
+                doc["objects"][0]["visible"].clone(),
+                doc["objects"][1]["visible"].clone(),
+            )
+        };
+        set.apply_saved(&json!({"timeofday": {"value": "4"}}));
+        assert_eq!(render(&set), (json!(false), json!(true)), "day selected");
+        set.apply_saved(&json!({"timeofday": {"value": "3"}}));
+        assert_eq!(
+            render(&set),
+            (json!(false), json!(false)),
+            "night hides the day group"
+        );
+    }
+
+    #[test]
+    fn a_binding_to_an_unknown_property_falls_back_to_the_authored_value() {
+        let set = PropertySet::default();
+        let mut doc = json!({"alpha": {"user": "gone", "value": 0.75}});
+        set.resolve(&mut doc);
+        assert_eq!(doc["alpha"], json!(0.75), "still usable, not null");
+    }
+
+    /// SceneScript is counted, not executed: the field keeps its static value.
+    #[test]
+    fn a_script_binding_is_kept_verbatim_and_counted() {
+        let set = PropertySet::default();
+        let mut doc = json!({
+            "origin": {"script": "let a = 1;", "value": "0.5 0.5 0.5"},
+            "other": 1
+        });
+        let skipped = set.resolve(&mut doc);
+        assert_eq!(skipped, 1);
+        assert_eq!(doc["origin"]["value"], json!("0.5 0.5 0.5"));
+        assert!(
+            doc["origin"]["script"].is_string(),
+            "the script is preserved"
+        );
+        assert_eq!(PropertySet::count_scripts(&doc), 1);
+    }
+
+    #[test]
+    fn bindings_nested_in_arrays_and_objects_are_all_resolved() {
+        let g = json!({"properties": {"n": {"type":"slider","min":0,"max":10,"value":7}}});
+        let set = PropertySet::from_general(&g);
+        let mut doc = json!({"a": [{"b": {"count": {"user":"n","value":1}}}]});
+        set.resolve(&mut doc);
+        assert_eq!(doc["a"][0]["b"]["count"], json!(7));
     }
 }

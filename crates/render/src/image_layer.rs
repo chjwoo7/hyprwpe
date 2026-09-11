@@ -29,7 +29,7 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
@@ -45,6 +45,7 @@ use crate::scaling::{place, Scaling};
 use crate::scene_layer::ScenePlayer;
 use crate::shader_layer::ShaderPlayer;
 use crate::video_layer::VideoPlayer;
+use hyprwpe_core::properties::PropertySet;
 use hyprwpe_core::Kind;
 use smithay_client_toolkit::compositor::FrameCallbackData;
 
@@ -57,11 +58,18 @@ use smithay_client_toolkit::compositor::FrameCallbackData;
 /// layer and expects the shell to stop painting while it is running.
 pub const WALLPAPER_LAYER: Layer = Layer::Background;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WallpaperSpec {
     pub path: PathBuf,
     pub scaling: Scaling,
     pub kind: Kind,
+    /// The wallpaper's user properties with the user's saved values applied.
+    ///
+    /// Resolved once when the wallpaper is set rather than looked up per frame:
+    /// a declaration is read from disk, and doing that inside a render loop
+    /// would cost a file read every frame. Empty for wallpapers that expose
+    /// nothing, which is most of them and every non-scene kind.
+    pub properties: PropertySet,
 }
 
 /// Which outputs a change applies to.
@@ -128,6 +136,10 @@ pub struct Wallpapers {
     /// Applies to any output without its own entry.
     default_spec: Option<WallpaperSpec>,
     per_output: HashMap<String, WallpaperSpec>,
+    /// Saved user-property values, keyed by wallpaper path. Held here so
+    /// `snapshot` writes back exactly what was applied, and so a wallpaper set
+    /// again keeps the values it was last tuned with.
+    properties: BTreeMap<String, serde_json::Value>,
     /// Decoded pixels, held only between load and draw. A 4K image is tens of
     /// megabytes and the compositor owns the copy that matters once committed,
     /// so it is released after every draw and decoded again on demand.
@@ -167,6 +179,7 @@ impl Wallpapers {
             pool,
             default_spec: None,
             per_output: HashMap::new(),
+            properties: BTreeMap::new(),
             cache: None,
             background: [0, 0, 0, 255],
             layers: Vec::new(),
@@ -207,6 +220,77 @@ impl Wallpapers {
                 .iter()
                 .map(|(name, spec)| (name.clone(), assignment(spec)))
                 .collect(),
+            properties: self.properties.clone(),
+        }
+    }
+
+    /// Set one user property and keep the saved values here.
+    ///
+    /// The validation and merge rules live in `State::set_property` so the
+    /// daemon, the CLI and any other writer cannot diverge; this moves the
+    /// values in, applies it there, and moves them back - including when the
+    /// call fails, so a rejected value cannot lose the ones already saved.
+    pub fn set_property(
+        &mut self,
+        path: &Path,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let mut shim = State {
+            properties: std::mem::take(&mut self.properties),
+            ..State::default()
+        };
+        let result = shim.set_property(path, key, value);
+        self.properties = shim.properties;
+        result
+    }
+
+    /// A wallpaper's user properties with the saved values applied.
+    ///
+    /// Used when a wallpaper is set, so the spec carries the user's choices
+    /// without the render loop ever touching disk.
+    pub fn resolve_properties(&self, path: &Path) -> PropertySet {
+        let mut set = PropertySet::for_wallpaper(path);
+        if let Some(saved) = self.properties.get(&State::properties_key(path)) {
+            set.apply_saved(saved);
+        }
+        set
+    }
+
+    /// Replace the saved user-property values.
+    ///
+    /// Called by the daemon after a wallpaper is set, so a spec built here has
+    /// the user's choices baked in and no per-frame lookup is needed.
+    pub fn set_saved_properties(&mut self, properties: BTreeMap<String, serde_json::Value>) {
+        self.properties = properties;
+    }
+
+    /// Rebuild a currently shown wallpaper's spec with fresh property values,
+    /// so a settings change takes effect without an explicit re-`set`.
+    pub fn refresh_properties(&mut self, path: &Path) {
+        let key = State::properties_key(path);
+        let resolved = {
+            let mut set = hyprwpe_core::properties::PropertySet::for_wallpaper(path);
+            if let Some(saved) = self.properties.get(&key) {
+                set.apply_saved(saved);
+            }
+            set
+        };
+        for spec in self
+            .default_spec
+            .iter_mut()
+            .chain(self.per_output.values_mut())
+        {
+            if State::properties_key(&spec.path) == key {
+                spec.properties = resolved.clone();
+            }
+        }
+        // Force the scene to be rebuilt on the next draw: the surface holds the
+        // *old* layers, and nothing else would notice the change.
+        for layer in &mut self.layers {
+            if let Backend::Scene { .. } = &layer.backend {
+                layer.backend = Backend::Idle;
+            }
         }
     }
 
@@ -214,12 +298,12 @@ impl Wallpapers {
     /// because setting the default deliberately clears them.
     pub fn restore(&mut self, state: &State) {
         if let Some(a) = &state.default {
-            if let Some(spec) = spec_from(a) {
+            if let Some(spec) = spec_from(a, state) {
                 self.set(Target::All, spec);
             }
         }
         for (name, a) in &state.outputs {
-            if let Some(spec) = spec_from(a) {
+            if let Some(spec) = spec_from(a, state) {
                 self.set(Target::Output(name.clone()), spec);
             }
         }
@@ -349,6 +433,7 @@ impl Wallpapers {
                 path: path.to_path_buf(),
                 scaling,
                 kind: Kind::Image,
+                properties: PropertySet::default(),
             },
         );
 
@@ -686,8 +771,9 @@ impl Wallpapers {
             let surface = gl.create_surface(&wl_surface, width as i32, height as i32)?;
             gl.make_current(&surface)?;
 
-            let mut player = ScenePlayer::new(&spec.path, &gl.gl, spec.scaling)
-                .with_context(|| format!("loading scene {}", spec.path.display()))?;
+            let mut player =
+                ScenePlayer::with_properties(&spec.path, &gl.gl, spec.scaling, &spec.properties)
+                    .with_context(|| format!("loading scene {}", spec.path.display()))?;
             if self.paused {
                 player.set_paused(true);
             }
@@ -814,7 +900,11 @@ fn assignment(spec: &WallpaperSpec) -> Assignment {
 
 /// An assignment whose scaling name is not recognised is dropped rather than
 /// guessed: a state file written by a newer version should degrade quietly.
-fn spec_from(a: &Assignment) -> Option<WallpaperSpec> {
+fn spec_from(a: &Assignment, state: &State) -> Option<WallpaperSpec> {
+    let mut properties = hyprwpe_core::properties::PropertySet::for_wallpaper(&a.path);
+    if let Some(saved) = state.properties.get(&State::properties_key(&a.path)) {
+        properties.apply_saved(saved);
+    }
     Some(WallpaperSpec {
         path: a.path.clone(),
         scaling: Scaling::parse(&a.scaling)?,
@@ -823,6 +913,7 @@ fn spec_from(a: &Assignment) -> Option<WallpaperSpec> {
             .as_deref()
             .and_then(kind_from_str)
             .unwrap_or(Kind::Image),
+        properties,
     })
 }
 

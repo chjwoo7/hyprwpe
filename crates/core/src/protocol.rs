@@ -59,6 +59,17 @@ pub enum Request {
     /// Liveness check. A stale socket file fails to connect; a live daemon
     /// answers.
     Ping,
+    /// The user properties a wallpaper exposes, with the currently saved values
+    /// applied. This is what a settings panel renders itself from.
+    Properties {
+        path: PathBuf,
+    },
+    /// Set one user property of a wallpaper and re-apply it live.
+    SetProperty {
+        path: PathBuf,
+        key: String,
+        value: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +77,14 @@ pub enum Request {
 pub enum Response {
     Ok,
     Status(Status),
+    /// A wallpaper's settings, as declared by the creator.
+    Properties {
+        properties: Vec<crate::properties::Property>,
+        /// How many fields the scene drives from SceneScript. Reported so a
+        /// caller can say plainly that some settings will not visibly change:
+        /// the engine runs that JavaScript and hyprwpe does not.
+        script_bindings: usize,
+    },
     /// The request was understood but could not be carried out.
     Error {
         message: String,

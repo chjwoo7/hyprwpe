@@ -9,6 +9,7 @@
 use anyhow::{bail, Context, Result};
 use hyprwpe_core::protocol::{self, Request, Response, Status};
 use hyprwpe_core::settings::State;
+use hyprwpe_core::assets::Resources;
 use hyprwpe_core::Kind;
 use hyprwpe_render::{Scaling, Target, WallpaperSpec, Wallpapers};
 use smithay_client_toolkit::reexports::{
@@ -64,6 +65,9 @@ pub fn run() -> Result<()> {
     let mut saved = State::load();
     saved.prune_missing();
     wallpapers.restore(&saved);
+    // Keep the saved property values where the renderer can reach them, so a
+    // spec built here bakes in the user's choices.
+    wallpapers.set_saved_properties(saved.properties.clone());
 
     let mut event_loop: EventLoop<Wallpapers> =
         EventLoop::try_new().context("creating the event loop")?;
@@ -220,6 +224,44 @@ fn handle(req: Request, state: &mut Wallpapers, policy: &Rc<RefCell<PolicyEngine
             Response::Ok
         }
 
+        Request::Properties { path } => {
+            let set = state.resolve_properties(&path);
+            if set.is_empty() {
+                return Response::Error {
+                    message: format!("{} exposes no user properties", path.display()),
+                };
+            }
+            // Count the script bindings the scene uses, so a panel can say that
+            // some settings are driven by JavaScript hyprwpe does not run.
+            let script_bindings = Resources::open(&path)
+                .ok()
+                .and_then(|pkg| pkg.get_str("scene.json"))
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .map(|doc| hyprwpe_core::properties::PropertySet::count_scripts(&doc))
+                .unwrap_or(0);
+            Response::Properties {
+                properties: set.properties,
+                script_bindings,
+            }
+        }
+
+        Request::SetProperty { path, key, value } => {
+            match state.set_property(&path, &key, &value) {
+                Ok(stored) => {
+                    // Rebuild the scene so the change is visible without a
+                    // second `set`, then persist: the value is only real once
+                    // it is in the state file.
+                    state.refresh_properties(&path);
+                    if let Err(e) = state.snapshot().save() {
+                        eprintln!("hyprwpe: could not save state: {e:#}");
+                    }
+                    let _ = stored;
+                    Response::Ok
+                }
+                Err(message) => Response::Error { message },
+            }
+        }
+
         Request::Status => Response::Status(Status {
             outputs: state.status(),
             paused: policy.borrow().is_paused() || state.is_paused(),
@@ -293,6 +335,7 @@ fn prepare_set(
             path: path.to_path_buf(),
             scaling,
             kind,
+            properties: state.resolve_properties(path),
         },
     ))
 }

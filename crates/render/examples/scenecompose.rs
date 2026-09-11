@@ -11,6 +11,7 @@
 
 use hyprwpe_core::assets::Resources;
 use hyprwpe_core::particle as particle_def;
+use hyprwpe_core::properties::PropertySet;
 use hyprwpe_core::scene::{ObjectKind, Scene};
 use hyprwpe_core::tex::TexImage;
 use hyprwpe_render::particle::Sim as ParticleSim;
@@ -384,9 +385,55 @@ fn main() {
         })
         .unwrap_or(0.0);
 
+    // Optional `--set key=value` (anywhere after the positional args) applies a
+    // wallpaper setting, so a property change can be seen as pixels without a
+    // daemon: render once, render again with `--set`, compare.
+    let mut overrides: Vec<(String, String)> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--set" {
+            if let Some(kv) = args.get(i + 1) {
+                if let Some((k, v)) = kv.split_once('=') {
+                    overrides.push((k.to_string(), v.to_string()));
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+
     let pkg = Resources::open(std::path::Path::new(pkg_path)).expect("open pkg");
     let scene_json = pkg.get_str("scene.json").expect("scene.json");
-    let scene = Scene::from_json_str(&scene_json).expect("scene json");
+
+    // A wallpaper's settings live beside the package, so an override needs the
+    // real declaration to validate against rather than a free-for-all.
+    let properties = {
+        let mut set = PropertySet::for_wallpaper(std::path::Path::new(pkg_path));
+        for (k, v) in &overrides {
+            if let Some(prop) = set.get(k) {
+                let raw = serde_json::from_str(v)
+                    .unwrap_or_else(|_| serde_json::Value::String(v.clone()));
+                if let Some(coerced) = prop.coerce(&raw) {
+                    if let Some(p) = set.properties.iter_mut().find(|p| p.key == *k) {
+                        p.value = coerced.clone();
+                    }
+                    println!("set {k} = {coerced}");
+                } else {
+                    eprintln!("warning: {v} is not a valid value for {k}");
+                }
+            } else {
+                let known: Vec<&str> = set.editable().map(|p| p.key.as_str()).collect();
+                eprintln!(
+                    "warning: no property {k:?} on this wallpaper; it has: {}",
+                    known.join(", ")
+                );
+            }
+        }
+        set
+    };
+
+    let scene = Scene::from_json_with_properties(&scene_json, &properties).expect("scene json");
     let raw: serde_json::Value = serde_json::from_str(&scene_json).unwrap();
 
     let design = raw

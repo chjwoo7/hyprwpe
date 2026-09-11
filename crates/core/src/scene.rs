@@ -625,6 +625,28 @@ impl Scene {
         Ok(scene)
     }
 
+    /// Parse a scene with a wallpaper's user properties applied.
+    ///
+    /// Bindings are resolved on the document *before* it is deserialised, so
+    /// every consumer downstream - renderer, tools, tests - sees plain values
+    /// and needs no knowledge of the binding syntax at all. Serialising back is
+    /// deliberate: `attach_animations` works on the raw text, so going through
+    /// `from_json_str` keeps one parsing path rather than two that can drift.
+    pub fn from_json_with_properties(
+        json: &str,
+        properties: &crate::properties::PropertySet,
+    ) -> Result<Self, serde_json::Error> {
+        if properties.is_empty() {
+            return Self::from_json_str(json);
+        }
+        let json = json.strip_prefix("\u{feff}").unwrap_or(json);
+        let mut doc: serde_json::Value = serde_json::from_str(json)?;
+        properties.resolve(&mut doc);
+        let resolved = serde_json::to_string(&doc)
+            .map_err(|e| serde_json::Error::io(std::io::Error::other(e)))?;
+        Self::from_json_str(&resolved)
+    }
+
     /// Parse a scene from a reader.
     pub fn from_reader<R: std::io::Read>(reader: R) -> Result<Self, serde_json::Error> {
         let mut buf = String::new();
@@ -843,6 +865,53 @@ mod tests {
         let scene = Scene::from_json_str(json).unwrap();
         assert_eq!(scene.animations.len(), 2);
         assert!(scene.animations.iter().all(|m| m.is_empty()));
+    }
+
+    /// The whole settings path, declaration to scene graph: a wallpaper's user
+    /// property must change what the parsed scene says, because that is what
+    /// the renderer reads. This is the headless half of the proof; the pixel
+    /// half is `scenecompose --set` (see docs/SCENE-COVERAGE.md).
+    #[test]
+    fn user_properties_change_the_parsed_scene() {
+        use crate::properties::PropertySet;
+        let json = r#"{
+            "general": {"properties": {
+                "crtfilter": {"type":"bool","text":"CRT Filter","value":true}
+            }},
+            "objects": [
+                {"name":"crt","visible":{"user":"crtfilter","value":true},
+                 "image":"models/crt.json","origin":"0 0 0","size":"1920 1080"},
+                {"name":"bg","visible":true,
+                 "image":"materials/bg.json","origin":"0 0 0","size":"1920 1080"}
+            ]
+        }"#;
+        let mut set = PropertySet::from_document(&serde_json::from_str(json).unwrap());
+        assert_eq!(set.len(), 1);
+
+        // Default: the filter is on, so the layer it drives is visible.
+        let on = Scene::from_json_with_properties(json, &set).unwrap();
+        assert!(on.objects[0].is_visible(), "filter layer visible while on");
+        assert!(on.objects[1].is_visible(), "an unbound object is untouched");
+
+        // Turn it off: the layer the property drives goes away.
+        set.apply_saved(&serde_json::json!({"crtfilter": {"value": false}}));
+        let off = Scene::from_json_with_properties(json, &set).unwrap();
+        assert!(!off.objects[0].is_visible(), "filter layer hidden once off");
+        assert!(off.objects[1].is_visible(), "still untouched");
+
+        // The setting must actually change the scene, not merely be stored.
+        assert_ne!(on.objects[0].is_visible(), off.objects[0].is_visible());
+    }
+
+    /// Parsing without properties must not disturb a scene that has none.
+    #[test]
+    fn an_empty_property_set_parses_the_scene_unchanged() {
+        use crate::properties::PropertySet;
+        let json = r#"{"objects":[{"name":"a","visible":false,"image":"materials/a.json"}]}"#;
+        let a = Scene::from_json_str(json).unwrap();
+        let b = Scene::from_json_with_properties(json, &PropertySet::default()).unwrap();
+        assert_eq!(a.objects[0].is_visible(), b.objects[0].is_visible());
+        assert!(!b.objects[0].is_visible());
     }
 
     #[test]
