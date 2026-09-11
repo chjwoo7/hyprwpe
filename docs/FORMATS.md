@@ -206,10 +206,33 @@ seen in the corpus: `origin` (10 objects), `alpha` (10), `angles` (4), `scale`
 frame rather than inventing motion.
 
 **Puppet models.** A `models/*.json` may name a `"puppet": "…_puppet.mdl"`
-next to its `material`; 12 of 75 scenes reference one. Those MDLV0023 files carry
-a deforming mesh (sections `MDLS####` skeleton, `MDLA####` animation) and drive
-character motion — **not yet implemented**; such a model currently renders as its
-static material texture.
+next to its `material`; 12 of 75 scenes reference one. Those are
+**versioned, self-describing** model files.
+
+The corpus (48 `.mdl` across 12 scenes) holds **five format versions**:
+
+| Version | Files | Sections |
+| --- | --- | --- |
+| `MDLV0013` | 19 | `MDLS0001`, `MDLA0001` |
+| `MDLV0014` | 3 | `MDLS0002`, `MDLA0002` |
+| `MDLV0016` | 11 | `MDLS0002`, `MDLA0003` |
+| `MDLV0017` | 1 | `MDLS0002`, `MDAT0001`, `MDLA0004` |
+| `MDLV0023` | 14 | `MDLS0004`, `MDAT0001`, `MDLA0006` |
+
+The first eight bytes are the version tag; the file then holds
+`MDLS####` (skeleton / control points), an optional `MDAT####`
+(attachments), `MDLA####` (animation), an optional `MDLE####` (end), and the
+mesh. **A parser must be version-agnostic**: locating sections by their tags
+gives the expected order `MDLV → MDLS → [MDAT] → MDLA → [MDLE]` for **48/48
+files**, and each section's own numeric suffix (`0001`…`0006`) says how to read
+it — so support for a new version is a table entry, never a per-wallpaper
+branch. Reading one specific file's offsets would cover 14/48 at best.
+
+Concretely: the mesh replaces the quad, is drawn `translucent` + `nocull` with
+depth test off, and a model may carry a `cropoffset`. **Not yet implemented** —
+such a model currently renders as its static material texture. `tools/mdl_corpus.py`
+extracts every `.mdl` for cross-version testing; `tools/extract_pkg.py` pulls a
+single entry from a package.
 
 ## `.tex` textures — confirmed
 

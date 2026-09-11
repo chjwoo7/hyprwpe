@@ -3,6 +3,7 @@
 
 pub mod gl;
 pub mod image_layer;
+pub mod mesh;
 pub mod mpv_dl;
 pub mod scaling;
 pub mod scene_layer;

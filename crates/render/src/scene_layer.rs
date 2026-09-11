@@ -553,6 +553,21 @@ fn is_image_file(path: &str) -> bool {
         || lower.ends_with(".bmp")
 }
 
+/// If the object's image resolves through a model JSON that names a puppet
+/// model, return the package path of that `.mdl`.
+///
+/// A puppet replaces the flat quad with a deforming mesh, so the renderer needs
+/// to know about it rather than drawing the material texture on a rectangle.
+pub fn resolve_puppet_file(pkg: &Package, image_ref: &str) -> Option<String> {
+    if is_image_file(image_ref) {
+        return None;
+    }
+    let body = pkg.get_str(image_ref)?;
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    let puppet = body.get("puppet")?.as_str()?;
+    pkg.get(puppet).is_some().then(|| puppet.to_string())
+}
+
 /// Resolve a material texture name to a real package entry.
 ///
 /// Corpus evidence (75 scene packages, 475 matching references): the names in
